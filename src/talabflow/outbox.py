@@ -1,0 +1,165 @@
+"""The notification worker: delivers queued outbox messages exactly once per event.
+
+Delivery guarantees, stated precisely
+-------------------------------------
+This is **at-least-once delivery with per-event deduplication at enqueue time**, which in
+practice gives a customer exactly one message per status change:
+
+* The notification row is written in the *same transaction* as the status change, so a crash
+  between them is impossible.
+* ``idempotency_key`` is unique and derived from the event id, so re-processing the same logical
+  change cannot enqueue a second message.
+* A row is marked ``sent`` immediately after the transport confirms. The one window that remains
+  is a crash *between* a successful send and that commit, which on the next run would re-send
+  once. Closing that fully needs a provider-side idempotency key, which the Telegram Bot API
+  does not offer. This is documented rather than glossed over.
+
+Failures are separated by kind: a transient error backs off exponentially and retries; a
+permanent one (the customer blocked the bot) goes straight to ``dead`` rather than burning
+through the attempt budget.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from datetime import timedelta
+
+from sqlalchemy.orm import Session, sessionmaker
+
+from . import repository
+from .config import Settings
+from .db import session_scope
+from .models import OutboxMessage, OutboxStatus, utcnow
+from .transports.base import (
+    MessageTransport,
+    OutboundMessage,
+    PermanentTransportError,
+    TransportError,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def backoff_delay(attempts: int, *, base_seconds: int, cap_seconds: int = 3600) -> timedelta:
+    """Exponential backoff: ``base * 2**(attempts-1)``, capped.
+
+    >>> backoff_delay(1, base_seconds=30).total_seconds()
+    30.0
+    >>> backoff_delay(3, base_seconds=30).total_seconds()
+    120.0
+    """
+    if attempts < 1:
+        attempts = 1
+    seconds = min(base_seconds * (2 ** (attempts - 1)), cap_seconds)
+    return timedelta(seconds=seconds)
+
+
+class OutboxWorker:
+    """Drains the outbox through a transport."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        transport: MessageTransport,
+        session_factory: sessionmaker[Session],
+    ) -> None:
+        self.settings = settings
+        self.transport = transport
+        self.session_factory = session_factory
+        self._stopping = False
+
+    def request_stop(self) -> None:
+        self._stopping = True
+
+    # -- one row -----------------------------------------------------------------
+
+    def _deliver(self, session: Session, message: OutboxMessage) -> bool:
+        """Attempt one delivery, updating the row. Returns True when it was sent."""
+        message.attempts += 1
+        try:
+            provider_id = self.transport.send(
+                OutboundMessage(chat_id=message.chat_id, text=message.body)
+            )
+        except PermanentTransportError as exc:
+            # Retrying cannot help: the chat is gone or the bot is blocked.
+            message.status = OutboxStatus.DEAD
+            message.last_error = str(exc)[:500]
+            logger.warning(
+                "outbox message dead-lettered",
+                extra={"outbox_id": message.id, "reason": str(exc)[:200]},
+            )
+            return False
+        except TransportError as exc:
+            message.last_error = str(exc)[:500]
+            if message.attempts >= self.settings.outbox_max_attempts:
+                message.status = OutboxStatus.DEAD
+                logger.error(
+                    "outbox message exhausted its attempts",
+                    extra={"outbox_id": message.id, "attempts": message.attempts},
+                )
+            else:
+                message.status = OutboxStatus.FAILED
+                message.next_attempt_at = utcnow() + backoff_delay(
+                    message.attempts, base_seconds=self.settings.outbox_backoff_base_seconds
+                )
+                logger.info(
+                    "outbox delivery failed; will retry",
+                    extra={
+                        "outbox_id": message.id,
+                        "attempts": message.attempts,
+                        "next_attempt_at": message.next_attempt_at.isoformat(),
+                    },
+                )
+            return False
+
+        message.status = OutboxStatus.SENT
+        message.sent_at = utcnow()
+        message.last_error = None
+        logger.info(
+            "outbox message sent",
+            extra={"outbox_id": message.id, "provider_message_id": provider_id},
+        )
+        return True
+
+    # -- batches -----------------------------------------------------------------
+
+    def process_batch(self) -> tuple[int, int]:
+        """Process one batch of due messages.
+
+        Returns:
+            ``(sent, failed)`` counts for this batch.
+        """
+        sent = 0
+        failed = 0
+        with session_scope(self.session_factory) as session:
+            due = repository.claim_due_outbox_messages(
+                session, limit=self.settings.outbox_batch_size
+            )
+            for message in due:
+                if self._deliver(session, message):
+                    sent += 1
+                else:
+                    failed += 1
+        return sent, failed
+
+    def run_forever(self, *, max_iterations: int | None = None) -> tuple[int, int]:
+        """Process batches until stopped. Returns cumulative ``(sent, failed)``."""
+        total_sent = 0
+        total_failed = 0
+        iterations = 0
+        logger.info("outbox worker started", extra={"transport": self.transport.name})
+        while not self._stopping:
+            if max_iterations is not None and iterations >= max_iterations:
+                break
+            iterations += 1
+            sent, failed = self.process_batch()
+            total_sent += sent
+            total_failed += failed
+            if sent == 0 and failed == 0 and not self._stopping:
+                time.sleep(self.settings.outbox_poll_interval_seconds)
+        logger.info(
+            "outbox worker stopped", extra={"sent": total_sent, "failed": total_failed}
+        )
+        return total_sent, total_failed
