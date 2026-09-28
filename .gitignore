@@ -1,0 +1,44 @@
+# Environments
+.venv/
+venv/
+env/
+
+# Secrets and local configuration -- never commit these
+.env
+.env.*
+!.env.example
+
+# Databases hold customer personal data: names, phone numbers, addresses
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+
+# Exports contain the same personal data
+*.xlsx
+*.csv
+
+# Telegram update offset (local runtime state)
+telegram-offset.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

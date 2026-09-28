@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "talabflow"
+version = "0.1.0"
+description = "Turn chat conversations into tracked orders with a reference number, a status pipeline, an admin API and spreadsheet export."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["telegram", "orders", "crm", "fastapi", "sqlalchemy", "automation"]
+
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn>=0.30,<1.0",
+  "pydantic>=2.7,<3.0",
+  "pydantic-settings>=2.3,<3.0",
+  "SQLAlchemy>=2.0,<3.0",
+  "alembic>=1.13,<2.0",
+  "httpx>=0.27,<1.0",
+  "PyJWT>=2.8,<3.0",
+  "openpyxl>=3.1,<4.0",
+  "typer>=0.12,<1.0",
+  "rich>=13.7,<15.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2,<9.0", "ruff>=0.5,<1.0", "mypy>=1.10,<3.0"]
+
+[project.scripts]
+talabflow = "talabflow.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "S"]
+ignore = [
+  "S101",   # assert is the idiom in tests and for invariants the type system cannot express
+  # RUF001-003 flag Arabic letters as "ambiguous" Unicode. Customer-facing message templates
+  # in this project are bilingual by design, so these rules produce only false positives.
+  "RUF001",
+  "RUF002",
+  "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]
+"migrations/*" = ["E501"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/talabflow"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_optional = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
