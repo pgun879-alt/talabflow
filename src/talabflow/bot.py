@@ -90,9 +90,7 @@ class BotRunner:
             state = repository.get_conversation_state(
                 session, customer, default_step=Step.IDLE.value
             )
-            result = self.engine.handle(
-                session, customer=customer, state=state, text=message.text
-            )
+            result = self.engine.handle(session, customer=customer, state=state, text=message.text)
             texts = result.texts
             reference = result.created_order.reference if result.created_order else None
 
@@ -139,7 +137,9 @@ class BotRunner:
                 )
         return handled
 
-    def run_forever(self, *, idle_sleep_seconds: float = 1.0, max_iterations: int | None = None) -> int:
+    def run_forever(
+        self, *, idle_sleep_seconds: float = 1.0, max_iterations: int | None = None
+    ) -> int:
         """Poll until stopped.
 
         Args:
@@ -154,7 +154,8 @@ class BotRunner:
         total = 0
         iterations = 0
         logger.info(
-            "bot started", extra={"transport": self.transport.name, "services": len(self.engine.services)}
+            "bot started",
+            extra={"transport": self.transport.name, "services": len(self.engine.services)},
         )
         while not self._stopping:
             if max_iterations is not None and iterations >= max_iterations:

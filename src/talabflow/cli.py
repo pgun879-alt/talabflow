@@ -59,7 +59,7 @@ def create_staff(
     ] = None,
 ) -> None:
     """Create a staff user for the admin API."""
-    settings, factory = _bootstrap()
+    _, factory = _bootstrap()
     if password is None:
         password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
     try:
@@ -92,7 +92,9 @@ def list_staff() -> None:
         for column in ("id", "username", "role", "active"):
             table.add_column(column)
         for user in users:
-            table.add_row(str(user.id), user.username, user.role.value, "yes" if user.is_active else "no")
+            table.add_row(
+                str(user.id), user.username, user.role.value, "yes" if user.is_active else "no"
+            )
         console.print(table)
 
 

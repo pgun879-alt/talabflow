@@ -93,7 +93,9 @@ def get_or_create_customer(
     return customer
 
 
-def get_conversation_state(session: Session, customer: Customer, *, default_step: str) -> ConversationState:
+def get_conversation_state(
+    session: Session, customer: Customer, *, default_step: str
+) -> ConversationState:
     """Load the customer's conversation state, creating it at ``default_step`` if absent."""
     state = session.scalars(
         select(ConversationState).where(ConversationState.customer_id == customer.id)
@@ -354,7 +356,9 @@ def create_staff_user(
     username = username.strip().lower()
     if not username:
         raise ValueError("username must not be empty")
-    existing = session.scalars(select(StaffUser).where(StaffUser.username == username)).one_or_none()
+    existing = session.scalars(
+        select(StaffUser).where(StaffUser.username == username)
+    ).one_or_none()
     if existing is not None:
         raise DuplicateUserError(f"a user named {username!r} already exists")
 

@@ -16,15 +16,14 @@ Design decisions worth stating:
 
 from __future__ import annotations
 
-import enum
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Final
 
 from sqlalchemy import (
     Boolean,
     DateTime,
     Dialect,
-    Enum,
     ForeignKey,
     Index,
     Integer,
@@ -33,6 +32,9 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     func,
+)
+from sqlalchemy import (
+    Enum as SAEnum,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -87,7 +89,7 @@ class Base(DeclarativeBase):
     """Declarative base for all models."""
 
 
-class OrderStatus(str, enum.Enum):
+class OrderStatus(StrEnum):
     """The order pipeline."""
 
     NEW = "new"
@@ -118,14 +120,14 @@ ALLOWED_TRANSITIONS: Final[dict[OrderStatus, frozenset[OrderStatus]]] = {
 }
 
 
-class StaffRole(str, enum.Enum):
+class StaffRole(StrEnum):
     """Who may do what. ``ADMIN`` is a superset of ``STAFF``."""
 
     ADMIN = "admin"
     STAFF = "staff"
 
 
-class OutboxStatus(str, enum.Enum):
+class OutboxStatus(StrEnum):
     """Lifecycle of a queued customer notification."""
 
     PENDING = "pending"
@@ -143,7 +145,7 @@ class StaffUser(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[StaffRole] = mapped_column(
-        Enum(StaffRole, native_enum=False, length=16), nullable=False, default=StaffRole.STAFF
+        SAEnum(StaffRole, native_enum=False, length=16), nullable=False, default=StaffRole.STAFF
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -201,7 +203,7 @@ class Order(Base):
     contact_phone: Mapped[str] = mapped_column(String(32), nullable=False)
     address: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[OrderStatus] = mapped_column(
-        Enum(OrderStatus, native_enum=False, length=16),
+        SAEnum(OrderStatus, native_enum=False, length=16),
         nullable=False,
         default=OrderStatus.NEW,
         index=True,
@@ -235,10 +237,10 @@ class OrderEvent(Base):
         ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True
     )
     from_status: Mapped[OrderStatus | None] = mapped_column(
-        Enum(OrderStatus, native_enum=False, length=16)
+        SAEnum(OrderStatus, native_enum=False, length=16)
     )
     to_status: Mapped[OrderStatus] = mapped_column(
-        Enum(OrderStatus, native_enum=False, length=16), nullable=False
+        SAEnum(OrderStatus, native_enum=False, length=16), nullable=False
     )
     actor: Mapped[str] = mapped_column(
         String(64), nullable=False, comment="Staff username, or 'customer' / 'system'."
@@ -275,16 +277,14 @@ class OutboxMessage(Base):
     chat_id: Mapped[str] = mapped_column(String(64), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[OutboxStatus] = mapped_column(
-        Enum(OutboxStatus, native_enum=False, length=16),
+        SAEnum(OutboxStatus, native_enum=False, length=16),
         nullable=False,
         default=OutboxStatus.PENDING,
         index=True,
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(Text)
-    next_attempt_at: Mapped[datetime] = mapped_column(
-        UtcDateTime, nullable=False, default=utcnow
-    )
+    next_attempt_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
     created_at: Mapped[datetime] = mapped_column(
         UtcDateTime, nullable=False, server_default=func.now()
     )

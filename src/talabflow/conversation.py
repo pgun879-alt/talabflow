@@ -17,10 +17,10 @@ sending them, which is what makes it exhaustively testable without any transport
 
 from __future__ import annotations
 
-import enum
 import logging
 import re
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Final
 
 from sqlalchemy.orm import Session
@@ -47,7 +47,7 @@ _AFFIRMATIVE: Final[frozenset[str]] = frozenset(
 )
 
 
-class Step(str, enum.Enum):
+class Step(StrEnum):
     """Where the customer is in the intake flow."""
 
     IDLE = "idle"
@@ -213,9 +213,7 @@ class ConversationEngine:
         result.add(self._render("unknown_command"))
         return result
 
-    def _handle_status(
-        self, session: Session, *, customer: Customer, argument: str
-    ) -> TurnResult:
+    def _handle_status(self, session: Session, *, customer: Customer, argument: str) -> TurnResult:
         result = TurnResult()
         if not argument:
             result.add(self._render("status_usage"))
@@ -227,9 +225,7 @@ class ConversationEngine:
             return result
 
         # Scoped to this customer: a reference alone must not expose someone else's order.
-        order = repository.get_customer_order(
-            session, customer_id=customer.id, reference=reference
-        )
+        order = repository.get_customer_order(session, customer_id=customer.id, reference=reference)
         if order is None:
             result.add(self._render("status_not_found"))
             return result

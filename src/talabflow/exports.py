@@ -108,7 +108,11 @@ def orders_to_xlsx(orders: Sequence[Order], *, sheet_title: str = "Orders") -> b
     # produce a 500-character-wide column.
     for index, header in enumerate(headers, start=1):
         longest = max(
-            [len(header)] + [len(str(sheet.cell(row=row, column=index).value or "")) for row in range(2, sheet.max_row + 1)]
+            [len(header)]
+            + [
+                len(str(sheet.cell(row=row, column=index).value or ""))
+                for row in range(2, sheet.max_row + 1)
+            ]
         )
         sheet.column_dimensions[get_column_letter(index)].width = min(max(longest + 2, 10), 50)
 

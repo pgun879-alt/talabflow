@@ -24,8 +24,9 @@ CommaSeparated = Annotated[tuple[str, ...], NoDecode]
 #: brute-forcing an HS256 key stops being a realistic attack.
 MIN_SECRET_LENGTH = 32
 
-#: The placeholder shipped in .env.example. Refused outright so nobody deploys it.
-PLACEHOLDER_SECRET = "change-me"
+#: The placeholder shipped in .env.example. Refused outright in production so nobody deploys
+#: it. Not a secret -- it exists precisely so that using it as one fails loudly.
+PLACEHOLDER_SECRET = "change-me"  # noqa: S105
 
 
 class Settings(BaseSettings):

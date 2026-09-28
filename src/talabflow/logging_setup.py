@@ -55,9 +55,7 @@ def safe_extra(**values: Any) -> dict[str, Any]:
     This renames any colliding key by appending an underscore, so a log line degrades to a
     slightly odd field name instead of taking the request down.
     """
-    return {
-        (f"{key}_" if key in _RESERVED else key): value for key, value in values.items()
-    }
+    return {(f"{key}_" if key in _RESERVED else key): value for key, value in values.items()}
 
 
 def configure_logging(level: str = "INFO", *, json_output: bool = True) -> None:

@@ -55,7 +55,9 @@ class TokenRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
-    token_type: Literal["bearer"] = "bearer"
+    # S105 flags any string assigned to a name containing "token". This is the OAuth token
+    # *type* -- a protocol constant from RFC 6750, not a secret.
+    token_type: Literal["bearer"] = "bearer"  # noqa: S105
     expires_in_seconds: int
     role: str
 
@@ -172,7 +174,9 @@ def get_session(request: Request) -> Iterator[Session]:
         session.close()
 
 
-def _authenticate(request: Request, credentials: HTTPAuthorizationCredentials | None) -> TokenClaims:
+def _authenticate(
+    request: Request, credentials: HTTPAuthorizationCredentials | None
+) -> TokenClaims:
     settings: Settings = request.app.state.settings
     limiter: SlidingWindowRateLimiter = request.app.state.limiter
 
@@ -436,15 +440,11 @@ def create_app(settings: Settings | None = None, *, create_schema: bool = False)
             return Response(
                 content=orders_to_csv(page.items),
                 media_type="text/csv; charset=utf-8",
-                headers={
-                    "Content-Disposition": f'attachment; filename="orders-{stamp}.csv"'
-                },
+                headers={"Content-Disposition": f'attachment; filename="orders-{stamp}.csv"'},
             )
         return Response(
             content=orders_to_xlsx(page.items),
-            media_type=(
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            ),
+            media_type=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
             headers={"Content-Disposition": f'attachment; filename="orders-{stamp}.xlsx"'},
         )
 

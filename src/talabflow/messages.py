@@ -109,16 +109,10 @@ _TEMPLATES: Final[dict[str, dict[Language, str]]] = {
     },
     "status_result": {
         "en": (
-            "Order {reference}\n"
-            "  Service: {service}\n"
-            "  Status:  {status}\n"
-            "  Placed:  {created}"
+            "Order {reference}\n  Service: {service}\n  Status:  {status}\n  Placed:  {created}"
         ),
         "ar": (
-            "الطلب {reference}\n"
-            "  الخدمة: {service}\n"
-            "  الحالة: {status}\n"
-            "  تاريخ التسجيل: {created}"
+            "الطلب {reference}\n  الخدمة: {service}\n  الحالة: {status}\n  تاريخ التسجيل: {created}"
         ),
     },
     "status_usage": {

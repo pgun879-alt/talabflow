@@ -159,7 +159,5 @@ class OutboxWorker:
             total_failed += failed
             if sent == 0 and failed == 0 and not self._stopping:
                 time.sleep(self.settings.outbox_poll_interval_seconds)
-        logger.info(
-            "outbox worker stopped", extra={"sent": total_sent, "failed": total_failed}
-        )
+        logger.info("outbox worker stopped", extra={"sent": total_sent, "failed": total_failed})
         return total_sent, total_failed
