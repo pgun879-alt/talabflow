@@ -1,0 +1,78 @@
+# Runs the three long-lived processes this application needs.
+#
+#   docker compose up --build
+#
+# All three share one SQLite file on a named volume. That is fine for a single-site business and
+# is the documented default; for anything with real concurrency, point
+# TALABFLOW_DATABASE_URL at PostgreSQL (see the commented service at the bottom) -- the
+# application code needs no change, only the URL.
+
+name: talabflow
+
+x-common: &common
+  build: .
+  restart: unless-stopped
+  env_file:
+    - .env
+  environment:
+    TALABFLOW_DATABASE_URL: sqlite:////app/data/talabflow.sqlite3
+  volumes:
+    - talabflow-data:/app/data
+
+services:
+  migrate:
+    <<: *common
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+
+  api:
+    <<: *common
+    command: ["python", "-m", "talabflow.cli", "serve", "--host", "0.0.0.0", "--port", "8000"]
+    # Published on loopback only. A staff API should not be reachable from the network until
+    # someone puts a TLS-terminating reverse proxy in front of it and means to expose it.
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  bot:
+    <<: *common
+    command: ["python", "-m", "talabflow.cli", "run-bot"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *common
+    command: ["python", "-m", "talabflow.cli", "run-worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  talabflow-data:
+
+# To use PostgreSQL instead, uncomment this service, add
+#   TALABFLOW_DATABASE_URL: postgresql+psycopg://talabflow:${POSTGRES_PASSWORD}@db:5432/talabflow
+# to x-common's environment, add `psycopg[binary]` to the dependencies, and add a
+# `db: {condition: service_healthy}` entry to each depends_on block.
+#
+#  db:
+#    image: postgres:17-alpine
+#    environment:
+#      POSTGRES_DB: talabflow
+#      POSTGRES_USER: talabflow
+#      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+#    volumes:
+#      - talabflow-db:/var/lib/postgresql/data
+#    healthcheck:
+#      test: ["CMD-SHELL", "pg_isready -U talabflow -d talabflow"]
+#      interval: 10s
+#      retries: 5
