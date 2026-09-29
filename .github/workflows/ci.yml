@@ -1,0 +1,68 @@
+name: CI
+
+# Runs the same four checks that `make check` runs locally, in a clean container.
+#
+# Nothing here needs a secret, a token, or any network service. The whole test suite is offline:
+# every outbound HTTP call is served by an in-process mock transport, so CI proves the same thing
+# a reviewer can reproduce on their own machine.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${ github.workflow }-${ github.ref }
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Pinned via .python-version so CI and local development agree.
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        # An editable install straight from pyproject.toml -- the same command the README
+        # documents -- so CI also proves the documented install works from a clean checkout.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Formatting
+        run: ruff format --check .
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Types
+        run: mypy
+
+      - name: Migrations apply and match the models
+        env:
+          TALABFLOW_DATABASE_URL: sqlite:///ci.sqlite3
+          TALABFLOW_JWT_SECRET: ci-only-placeholder-secret-long-enough-for-hs256
+        run: |
+          alembic upgrade head
+          alembic check
+
+      - name: Tests
+        run: pytest
+
+      - name: Check for committed secrets and build artefacts
+        # A cheap, dependency-free backstop. It does not replace a scanner such as gitleaks; it
+        # catches the specific mistakes that matter here -- a real .env, a database, a virtual
+        # environment, or a credential-shaped literal reaching the repository.
+        run: python scripts/check_repo_hygiene.py
