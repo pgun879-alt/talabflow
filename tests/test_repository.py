@@ -315,7 +315,7 @@ def test_due_messages_are_claimed_oldest_first(session: Session, order: Order) -
     repository.change_order_status(
         session, order=order, to_status=OrderStatus.IN_PROGRESS, actor="amina"
     )
-    due = repository.claim_due_outbox_messages(session, limit=10)
+    due = repository.due_outbox_messages(session, limit=10)
     assert [message.id for message in due] == sorted(message.id for message in due)
 
 
@@ -326,7 +326,7 @@ def test_claiming_respects_the_batch_limit(session: Session, order: Order) -> No
     repository.change_order_status(
         session, order=order, to_status=OrderStatus.IN_PROGRESS, actor="amina"
     )
-    assert len(repository.claim_due_outbox_messages(session, limit=1)) == 1
+    assert len(repository.due_outbox_messages(session, limit=1)) == 1
 
 
 # --------------------------------------------------------------------- staff

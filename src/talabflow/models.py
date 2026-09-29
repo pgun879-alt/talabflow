@@ -128,12 +128,25 @@ class StaffRole(StrEnum):
 
 
 class OutboxStatus(StrEnum):
-    """Lifecycle of a queued customer notification."""
+    """Lifecycle of a queued customer notification.
+
+    ``PROCESSING`` is a *lease*: a worker has claimed the row and intends to send it. The claim is
+    committed before the outbound call is made, so a second worker looking for work will not pick
+    the same row. If the worker dies mid-send the lease expires and the row becomes claimable
+    again -- see :data:`OutboxMessage.lease_expires_at`.
+    """
 
     PENDING = "pending"
+    PROCESSING = "processing"
     SENT = "sent"
     FAILED = "failed"
     DEAD = "dead"
+
+
+#: Statuses from which a worker may claim a row (subject to ``next_attempt_at``).
+CLAIMABLE_OUTBOX_STATUSES: Final[frozenset[OutboxStatus]] = frozenset(
+    {OutboxStatus.PENDING, OutboxStatus.FAILED}
+)
 
 
 class StaffUser(Base):
@@ -260,14 +273,28 @@ class OutboxMessage(Base):
     """A customer notification queued for delivery.
 
     Written in the *same transaction* as the status change that caused it, so the two cannot
-    disagree. ``idempotency_key`` is unique, which is what makes the worker safe to run twice,
-    to crash mid-send, or to be restarted without double-messaging a customer.
+    disagree. ``idempotency_key`` is unique, which is what stops a duplicate row ever being
+    enqueued for one logical event.
+
+    Concurrency
+    -----------
+    Deduplicating at enqueue time is not enough on its own: two workers reading the same "due"
+    rows would each send them. So a worker must **claim** a row before sending --
+    :func:`talabflow.repository.claim_outbox_batch` sets ``status = processing`` together with
+    ``claimed_by`` / ``claimed_at`` / ``lease_expires_at``, and commits that claim *before* any
+    outbound call is made.
+
+    The lease is what makes a crash survivable. If the worker dies between claiming and sending,
+    the row stays ``processing`` with a ``lease_expires_at`` in the past, and the next claim sweep
+    picks it up again. Without a lease, a crashed worker would strand the message forever.
     """
 
     __tablename__ = "outbox_messages"
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_outbox_idempotency_key"),
         Index("ix_outbox_status_next_attempt", "status", "next_attempt_at"),
+        # Supports the "reclaim an expired lease" half of the claim query.
+        Index("ix_outbox_status_lease", "status", "lease_expires_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -285,6 +312,16 @@ class OutboxMessage(Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(Text)
     next_attempt_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    # --- lease fields, set by claim_outbox_batch and cleared on a terminal outcome ---
+    claimed_by: Mapped[str | None] = mapped_column(
+        String(64), comment="Worker identifier holding the current lease."
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        UtcDateTime, comment="After this moment another worker may reclaim the row."
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         UtcDateTime, nullable=False, server_default=func.now()
     )

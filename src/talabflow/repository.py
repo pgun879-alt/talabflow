@@ -11,15 +11,19 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Any, cast
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from .messages import Language, render, status_label
 from .models import (
     ALLOWED_TRANSITIONS,
+    CLAIMABLE_OUTBOX_STATUSES,
     ConversationState,
     Customer,
     Order,
@@ -323,22 +327,168 @@ def queue_status_notification(
     return message
 
 
-def claim_due_outbox_messages(
-    session: Session, *, limit: int, now: datetime | None = None
+def _claimable(moment: datetime) -> ColumnElement[bool]:
+    """Predicate for "this row may be claimed right now".
+
+    Either it is waiting and its retry time has arrived, or it is ``processing`` under a lease
+    that has expired -- which is how a message survives the worker that claimed it crashing.
+    """
+    return or_(
+        and_(
+            OutboxMessage.status.in_(tuple(CLAIMABLE_OUTBOX_STATUSES)),
+            OutboxMessage.next_attempt_at <= moment,
+        ),
+        and_(
+            OutboxMessage.status == OutboxStatus.PROCESSING,
+            OutboxMessage.lease_expires_at.is_not(None),
+            OutboxMessage.lease_expires_at <= moment,
+        ),
+    )
+
+
+def due_outbox_messages(
+    session: Session, *, limit: int = 100, now: datetime | None = None
 ) -> list[OutboxMessage]:
-    """Return pending/failed messages whose retry time has arrived, oldest first."""
+    """Read-only view of what *could* be claimed. Does not claim anything.
+
+    For inspection, tests and the CLI. Workers must use :func:`claim_outbox_batch`.
+    """
     moment = now or utcnow()
     return list(
         session.scalars(
             select(OutboxMessage)
-            .where(
-                OutboxMessage.status.in_([OutboxStatus.PENDING, OutboxStatus.FAILED]),
-                OutboxMessage.next_attempt_at <= moment,
-            )
+            .where(_claimable(moment))
             .order_by(OutboxMessage.next_attempt_at, OutboxMessage.id)
             .limit(limit)
         )
     )
+
+
+def claim_outbox_batch(
+    session: Session,
+    *,
+    worker_id: str,
+    limit: int,
+    lease_seconds: int,
+    now: datetime | None = None,
+) -> list[OutboxMessage]:
+    """Atomically lease up to ``limit`` due messages to ``worker_id``, and commit the lease.
+
+    Why a single guarded ``UPDATE``
+    -------------------------------
+    Selecting due rows and then sending them is not safe with more than one worker: both would
+    select the same rows and both would send. The claim therefore has to be atomic.
+
+    This issues **one** statement::
+
+        UPDATE outbox_messages
+           SET status='processing', claimed_by=..., lease_expires_at=...
+         WHERE id IN (SELECT id ... WHERE <claimable> ORDER BY ... LIMIT n)
+           AND <claimable>          -- repeated deliberately
+
+    The repeated predicate in the outer ``WHERE`` is the part that matters, and it is not
+    redundant:
+
+    * On **PostgreSQL**, two concurrent statements can both pick the same id in their subqueries.
+      The second blocks on the row lock, and when it proceeds PostgreSQL re-evaluates the outer
+      ``WHERE`` against the newly committed row (``EvalPlanQual``). Without the repeated
+      predicate the row still matches by id and the second worker would overwrite the first
+      worker's lease. With it, the row is now ``processing`` with a future lease, the predicate
+      fails, and the row is not claimed.
+    * On **SQLite**, writes are serialised and a single ``UPDATE`` is atomic, so the second
+      worker's subquery simply sees the already-claimed rows and skips them.
+
+    The lease is **committed before returning**, so it is durable before any outbound call is
+    made. That ordering is the whole point: a crash after sending but before recording the send
+    leaves a claimed row whose lease expires, not an unclaimed row that a second worker resends
+    immediately.
+
+    Returns:
+        The rows this worker now owns, oldest first. Empty when there is nothing to do.
+    """
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+
+    moment = now or utcnow()
+    candidate_ids = (
+        select(OutboxMessage.id)
+        .where(_claimable(moment))
+        .order_by(OutboxMessage.next_attempt_at, OutboxMessage.id)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    session.execute(
+        update(OutboxMessage)
+        .where(OutboxMessage.id.in_(candidate_ids), _claimable(moment))
+        .values(
+            status=OutboxStatus.PROCESSING,
+            claimed_by=worker_id,
+            claimed_at=moment,
+            lease_expires_at=moment + timedelta(seconds=lease_seconds),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    # Commit so the lease is visible to every other worker before we send anything.
+    session.commit()
+
+    claimed = list(
+        session.scalars(
+            select(OutboxMessage)
+            .where(
+                OutboxMessage.status == OutboxStatus.PROCESSING,
+                OutboxMessage.claimed_by == worker_id,
+                OutboxMessage.claimed_at == moment,
+            )
+            .order_by(OutboxMessage.next_attempt_at, OutboxMessage.id)
+        )
+    )
+    if claimed:
+        logger.info(
+            "claimed outbox messages",
+            extra={"worker": worker_id, "claimed": len(claimed)},
+        )
+    return claimed
+
+
+def release_claim(message: OutboxMessage) -> None:
+    """Clear the lease fields once a row has reached a terminal or waiting state.
+
+    Leaving a stale ``claimed_by`` behind would make it impossible to tell a live lease from a
+    finished one when reading the table by hand.
+    """
+    message.claimed_by = None
+    message.claimed_at = None
+    message.lease_expires_at = None
+
+
+def reclaim_expired_leases(session: Session, *, now: datetime | None = None) -> int:
+    """Return ``processing`` rows with an expired lease to ``failed`` so they are retried.
+
+    The claim query already treats an expired lease as claimable, so this is an explicit
+    housekeeping path for an operator, not something the worker depends on.
+    """
+    moment = now or utcnow()
+    result = session.execute(
+        update(OutboxMessage)
+        .where(
+            OutboxMessage.status == OutboxStatus.PROCESSING,
+            OutboxMessage.lease_expires_at.is_not(None),
+            OutboxMessage.lease_expires_at <= moment,
+        )
+        .values(
+            status=OutboxStatus.FAILED,
+            claimed_by=None,
+            claimed_at=None,
+            lease_expires_at=None,
+            last_error="lease expired; the worker holding this message did not finish",
+        )
+        .execution_options(synchronize_session=False)
+    )
+    # Session.execute is typed as returning Result, but an UPDATE always yields a CursorResult,
+    # which is where rowcount lives.
+    return int(cast("CursorResult[Any]", result).rowcount or 0)
 
 
 # --------------------------------------------------------------------------- staff

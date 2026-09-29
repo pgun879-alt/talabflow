@@ -1,22 +1,28 @@
-"""The notification worker: delivers queued outbox messages exactly once per event.
+"""The notification worker: claims queued messages, then delivers them.
 
 Delivery guarantees, stated precisely
 -------------------------------------
-This is **at-least-once delivery with per-event deduplication at enqueue time**, which in
-practice gives a customer exactly one message per status change:
+This is **at-least-once delivery**. It is *not* exactly-once, and it cannot be: Telegram's
+``sendMessage`` offers no client-supplied idempotency key, so no client can make a redelivery a
+no-op on the provider's side.
 
-* The notification row is written in the *same transaction* as the status change, so a crash
-  between them is impossible.
-* ``idempotency_key`` is unique and derived from the event id, so re-processing the same logical
-  change cannot enqueue a second message.
-* A row is marked ``sent`` immediately after the transport confirms. The one window that remains
-  is a crash *between* a successful send and that commit, which on the next run would re-send
-  once. Closing that fully needs a provider-side idempotency key, which the Telegram Bot API
-  does not offer. This is documented rather than glossed over.
+What the design does guarantee:
 
-Failures are separated by kind: a transient error backs off exponentially and retries; a
-permanent one (the customer blocked the bot) goes straight to ``dead`` rather than burning
-through the attempt budget.
+* The notification row is written in the **same transaction** as the status change, so neither
+  can exist without the other.
+* ``idempotency_key`` is unique and derived from the audit event's id, so one logical change can
+  never produce two rows.
+* A worker **claims** a row -- committing ``status = processing`` with a lease -- *before* making
+  any outbound call. Two workers therefore never hold the same row at the same time.
+* A row is marked ``sent`` immediately after the transport confirms.
+
+The window that remains, stated plainly: if a worker crashes **after** the provider accepted the
+message but **before** the ``sent`` commit, the lease eventually expires and the message is sent a
+second time. That is inherent to at-least-once over a provider without idempotency keys.
+
+Failures are separated by kind: a transient error backs off exponentially and retries; a permanent
+one (the customer blocked the bot) goes straight to ``dead`` rather than burning the attempt
+budget.
 """
 
 from __future__ import annotations
@@ -29,7 +35,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from . import repository
 from .config import Settings
-from .db import session_scope
 from .models import OutboxMessage, OutboxStatus, utcnow
 from .transports.base import (
     MessageTransport,
@@ -68,6 +73,8 @@ class OutboxWorker:
         self.settings = settings
         self.transport = transport
         self.session_factory = session_factory
+        #: Identifies this worker in the claims it takes. Readable when inspecting the table.
+        self.worker_id = settings.worker_id
         self._stopping = False
 
     def request_stop(self) -> None:
@@ -86,6 +93,7 @@ class OutboxWorker:
             # Retrying cannot help: the chat is gone or the bot is blocked.
             message.status = OutboxStatus.DEAD
             message.last_error = str(exc)[:500]
+            repository.release_claim(message)
             logger.warning(
                 "outbox message dead-lettered",
                 extra={"outbox_id": message.id, "reason": str(exc)[:200]},
@@ -95,6 +103,7 @@ class OutboxWorker:
             message.last_error = str(exc)[:500]
             if message.attempts >= self.settings.outbox_max_attempts:
                 message.status = OutboxStatus.DEAD
+                repository.release_claim(message)
                 logger.error(
                     "outbox message exhausted its attempts",
                     extra={"outbox_id": message.id, "attempts": message.attempts},
@@ -104,6 +113,9 @@ class OutboxWorker:
                 message.next_attempt_at = utcnow() + backoff_delay(
                     message.attempts, base_seconds=self.settings.outbox_backoff_base_seconds
                 )
+                # Release the lease so the retry is claimable by whichever worker gets there
+                # first, rather than reserved for this one.
+                repository.release_claim(message)
                 logger.info(
                     "outbox delivery failed; will retry",
                     extra={
@@ -117,6 +129,7 @@ class OutboxWorker:
         message.status = OutboxStatus.SENT
         message.sent_at = utcnow()
         message.last_error = None
+        repository.release_claim(message)
         logger.info(
             "outbox message sent",
             extra={"outbox_id": message.id, "provider_message_id": provider_id},
@@ -126,22 +139,43 @@ class OutboxWorker:
     # -- batches -----------------------------------------------------------------
 
     def process_batch(self) -> tuple[int, int]:
-        """Process one batch of due messages.
+        """Claim a batch, then deliver it.
+
+        The claim is committed before any send, and each outcome is committed per message rather
+        than per batch. Committing per message matters: with one commit at the end of the batch, a
+        crash halfway through would roll back the ``sent`` marks of messages that had already been
+        delivered, and they would all go out again.
 
         Returns:
             ``(sent, failed)`` counts for this batch.
         """
         sent = 0
         failed = 0
-        with session_scope(self.session_factory) as session:
-            due = repository.claim_due_outbox_messages(
-                session, limit=self.settings.outbox_batch_size
+        session = self.session_factory()
+        try:
+            claimed = repository.claim_outbox_batch(
+                session,
+                worker_id=self.worker_id,
+                limit=self.settings.outbox_batch_size,
+                lease_seconds=self.settings.outbox_lease_seconds,
             )
-            for message in due:
-                if self._deliver(session, message):
-                    sent += 1
-                else:
+            for message in claimed:
+                try:
+                    if self._deliver(session, message):
+                        sent += 1
+                    else:
+                        failed += 1
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    logger.exception(
+                        "unexpected error delivering an outbox message; its lease will expire "
+                        "and it will be retried",
+                        extra={"outbox_id": message.id, "worker": self.worker_id},
+                    )
                     failed += 1
+        finally:
+            session.close()
         return sent, failed
 
     def run_forever(self, *, max_iterations: int | None = None) -> tuple[int, int]:
@@ -149,7 +183,10 @@ class OutboxWorker:
         total_sent = 0
         total_failed = 0
         iterations = 0
-        logger.info("outbox worker started", extra={"transport": self.transport.name})
+        logger.info(
+            "outbox worker started",
+            extra={"transport": self.transport.name, "worker": self.worker_id},
+        )
         while not self._stopping:
             if max_iterations is not None and iterations >= max_iterations:
                 break

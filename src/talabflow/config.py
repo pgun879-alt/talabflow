@@ -84,6 +84,20 @@ class Settings(BaseSettings):
     outbox_max_attempts: int = Field(default=5, ge=1, le=20)
     outbox_backoff_base_seconds: int = Field(default=30, ge=1, le=3600)
     outbox_poll_interval_seconds: float = Field(default=5.0, gt=0, le=600)
+    outbox_lease_seconds: int = Field(
+        default=120,
+        ge=5,
+        le=3600,
+        description="How long a worker's claim on a message is respected. After this, another "
+        "worker may reclaim it -- which is how a message survives the worker that claimed it "
+        "crashing. Must comfortably exceed the time one send can take, or a slow send will be "
+        "reclaimed and delivered twice.",
+    )
+    worker_id: str = Field(
+        default="",
+        description="Identifies this worker in outbox claims. Defaults to hostname:pid, which is "
+        "unique per process and readable when inspecting the table by hand.",
+    )
 
     # --- admin API ---------------------------------------------------------------
     api_rate_limit_per_minute: int = Field(default=120, ge=1, le=10_000)
@@ -116,6 +130,31 @@ class Settings(BaseSettings):
         if len(set(value)) != len(value):
             raise ValueError("TALABFLOW_SERVICE_TYPES must not contain duplicates")
         return value
+
+    @model_validator(mode="after")
+    def _default_worker_id(self) -> Settings:
+        if not self.worker_id:
+            import os
+            import socket
+
+            object.__setattr__(self, "worker_id", f"{socket.gethostname()}:{os.getpid()}"[:64])
+        return self
+
+    @model_validator(mode="after")
+    def _lease_outlives_a_send(self) -> Settings:
+        """A lease shorter than one send attempt would let a slow send be reclaimed mid-flight.
+
+        That is the one way this design could produce a duplicate message, so it is refused at
+        startup rather than left as a footgun.
+        """
+        if self.outbox_lease_seconds <= self.http_timeout_seconds:
+            raise ValueError(
+                f"TALABFLOW_OUTBOX_LEASE_SECONDS ({self.outbox_lease_seconds}) must be greater "
+                f"than TALABFLOW_HTTP_TIMEOUT_SECONDS ({self.http_timeout_seconds}), otherwise a "
+                "slow send can outlive its own lease and be reclaimed and re-sent by another "
+                "worker"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_coherence(self) -> Settings:
