@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -175,8 +176,21 @@ def get_session(request: Request) -> Iterator[Session]:
 
 
 def _authenticate(
-    request: Request, credentials: HTTPAuthorizationCredentials | None
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+    session: Session,
 ) -> TokenClaims:
+    """Verify the bearer token, then re-check the account behind it against the database.
+
+    A valid signature is not sufficient. Tokens live for up to an hour, so trusting the claims
+    alone means a staff member who is deactivated -- or demoted from admin -- keeps their old
+    access until the token happens to expire. Revocation that takes effect "within an hour" is not
+    revocation.
+
+    So the role used for authorisation is read from the row, not from the token, and a token whose
+    account has been deleted or deactivated is rejected immediately. The cost is one indexed
+    lookup per request, which is the right trade for a staff API.
+    """
     settings: Settings = request.app.state.settings
     limiter: SlidingWindowRateLimiter = request.app.state.limiter
 
@@ -206,23 +220,40 @@ def _authenticate(
             detail="rate limit exceeded",
             headers={"Retry-After": str(max(int(retry_after), 1))},
         )
-    return claims
+
+    user = repository.get_staff_user(session, claims.subject)
+    if user is None or not user.is_active:
+        logger.warning(
+            "token presented for an account that is gone or deactivated",
+            extra={"subject": claims.subject, "path": request.url.path},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="this account is no longer active",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Authorise on the stored role, not the token's copy of it, so a demotion takes effect on the
+    # next request rather than whenever the token happens to expire.
+    return replace(claims, role=user.role.value)
 
 
 def require_staff(
     request: Request,
+    session: Annotated[Session, Depends(get_session)],
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
 ) -> TokenClaims:
-    """Any authenticated staff member."""
-    return _authenticate(request, credentials)
+    """Any authenticated, still-active staff member."""
+    return _authenticate(request, credentials, session)
 
 
 def require_admin(
     request: Request,
+    session: Annotated[Session, Depends(get_session)],
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
 ) -> TokenClaims:
     """Admins only."""
-    claims = _authenticate(request, credentials)
+    claims = _authenticate(request, credentials, session)
     if claims.role != StaffRole.ADMIN.value:
         logger.warning(
             "role check failed",

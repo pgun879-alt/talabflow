@@ -14,7 +14,7 @@ from talabflow import repository
 from talabflow.api import create_app
 from talabflow.config import Settings
 from talabflow.db import session_scope
-from talabflow.models import OrderStatus
+from talabflow.models import OrderStatus, StaffRole
 
 from .conftest import ADMIN_PASSWORD, ADMIN_USERNAME, STAFF_PASSWORD, STAFF_USERNAME
 
@@ -355,7 +355,7 @@ def test_a_status_change_queues_a_customer_notification(
         json={"to_status": "confirmed"},
     )
     with session_scope(session_factory) as session:
-        due = repository.claim_due_outbox_messages(session, limit=10)
+        due = repository.due_outbox_messages(session, limit=10)
         assert len(due) == 1
         assert order_reference in due[0].body
 
@@ -431,3 +431,73 @@ def test_openapi_schema_is_generated(client: TestClient) -> None:
     paths = client.get("/openapi.json").json()["paths"]
     for expected in ["/v1/auth/token", "/v1/orders", "/v1/stats", "/v1/staff"]:
         assert expected in paths
+
+
+# --------------------------------------------------------------- token revocation
+
+
+def test_a_deactivated_account_loses_access_immediately(
+    client: TestClient, admin_headers: dict[str, str], session_factory: sessionmaker[Session]
+) -> None:
+    """A valid signature is not enough on its own.
+
+    Tokens last up to an hour. If the claims were trusted alone, deactivating a staff member would
+    not actually revoke anything until their token happened to expire -- and revocation that takes
+    effect "within an hour" is not revocation. The account is therefore re-checked per request.
+    """
+    assert client.get("/v1/orders", headers=admin_headers).status_code == 200
+
+    with session_scope(session_factory) as session:
+        user = repository.get_staff_user(session, ADMIN_USERNAME)
+        assert user is not None
+        user.is_active = False
+
+    response = client.get("/v1/orders", headers=admin_headers)
+    assert response.status_code == 401
+    assert "no longer active" in response.json()["detail"]
+
+
+def test_a_deleted_account_loses_access_immediately(
+    client: TestClient, staff_headers: dict[str, str], session_factory: sessionmaker[Session]
+) -> None:
+    assert client.get("/v1/orders", headers=staff_headers).status_code == 200
+
+    with session_scope(session_factory) as session:
+        user = repository.get_staff_user(session, STAFF_USERNAME)
+        assert user is not None
+        session.delete(user)
+
+    assert client.get("/v1/orders", headers=staff_headers).status_code == 401
+
+
+def test_a_demotion_takes_effect_on_the_next_request(
+    client: TestClient, admin_headers: dict[str, str], session_factory: sessionmaker[Session]
+) -> None:
+    """Authorisation reads the stored role, not the token's copy of it.
+
+    Otherwise an admin demoted to staff would keep admin powers for the life of their token.
+    """
+    assert client.get("/v1/staff", headers=admin_headers).status_code == 200
+
+    with session_scope(session_factory) as session:
+        user = repository.get_staff_user(session, ADMIN_USERNAME)
+        assert user is not None
+        user.role = StaffRole.STAFF
+
+    # The token still says "admin"; the database says otherwise, and the database wins.
+    assert client.get("/v1/staff", headers=admin_headers).status_code == 403
+    # ...but ordinary staff access still works.
+    assert client.get("/v1/orders", headers=admin_headers).status_code == 200
+
+
+def test_a_promotion_also_takes_effect_on_the_next_request(
+    client: TestClient, staff_headers: dict[str, str], session_factory: sessionmaker[Session]
+) -> None:
+    assert client.get("/v1/staff", headers=staff_headers).status_code == 403
+
+    with session_scope(session_factory) as session:
+        user = repository.get_staff_user(session, STAFF_USERNAME)
+        assert user is not None
+        user.role = StaffRole.ADMIN
+
+    assert client.get("/v1/staff", headers=staff_headers).status_code == 200
