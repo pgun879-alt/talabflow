@@ -6,7 +6,6 @@ env/
 # Secrets and local configuration -- never commit these
 .env
 .env.*
-!.env.example
 
 # Databases hold customer personal data: names, phone numbers, addresses
 data/
@@ -42,3 +41,11 @@ htmlcov/
 .idea/
 *.swp
 .DS_Store
+
+# Generated reports and exports -- these contain real operational data
+reports/
+*.log
+*.jsonl
+
+# Always keep the documented placeholder file
+!.env.example
