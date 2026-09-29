@@ -8,7 +8,7 @@ bot token and no network.**
 > chat message to a closed record.
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-298%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-324%20passing-brightgreen)](#testing)
 [![Types](https://img.shields.io/badge/mypy-clean-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -35,7 +35,7 @@ puts a real system behind it.
 
 | | Typical tutorial bot | `talabflow` |
 |---|---|---|
-| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 298 tests, zero network calls |
+| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 324 tests, zero network calls |
 | Conversation state | A dict in memory, lost on restart | Persisted per customer; a half-finished order survives a restart |
 | Unscripted input | Breaks on anything unexpected | Explicit state machine; every invalid value re-prompts |
 | Status changes | `UPDATE orders SET status=...` | Guarded transitions + an immutable audit event per change |
@@ -96,7 +96,7 @@ mid-order and the customer continues from where they were.
 ## Quickstart
 
 ```bash
-git clone <your-repo-url> talabflow && cd talabflow
+git clone https://github.com/<github-username>/talabflow.git && cd talabflow
 make setup
 make demo
 ```
@@ -234,21 +234,28 @@ make check      # ruff format --check + ruff check + mypy + pytest
 make test
 ```
 
-Verified on Python 3.13.9, Linux, at the time of writing:
+Verified on Python 3.13.9, Linux, by running these commands after the most recent change:
 
 ```
-298 passed in 8.71s
-Success: no issues found in 14 source files      # mypy
-All checks passed!                               # ruff
+324 passed                                       # pytest
+Success: no issues found in 19 source files      # mypy
+All checks passed!                               # ruff check
+41 files already formatted                       # ruff format --check
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same four checks in a clean container on every push, plus
+an Alembic `upgrade head` + `check` to prove migrations match the models, and a repository-hygiene
+scan that fails the build if a database, a virtual environment or a credential-shaped literal is
+ever committed.
 
 The suite runs **fully offline**. The Telegram transport is exercised through an in-process
 `httpx` mock transport, so request shape, offset persistence, update parsing and error
 classification are genuinely tested — without a token or a network call.
 
-Coverage is concentrated where the risk is: 47 tests on the conversation state machine, 32 on
-the repository and outbox write path, 25 on the Telegram transport, 39 on the API, 31 on
-security primitives.
+Coverage is concentrated where the risk is: 47 tests on the conversation state machine, 32 on the
+repository and outbox write path, 22 on outbox claiming and the duplicate-enqueue savepoint
+(`tests/test_outbox_claim.py`), 25 on the Telegram transport, 43 on the API, 31 on security
+primitives.
 
 ## Security
 
@@ -272,19 +279,57 @@ security primitives.
 
 ## Delivery guarantees, stated precisely
 
-This is **at-least-once delivery with per-event deduplication at enqueue time**, which in
-practice means a customer gets exactly one message per status change:
+This is **at-least-once delivery**. It is **not** exactly-once, and it cannot be: Telegram's
+`sendMessage` accepts no client-supplied idempotency key, so no client can make a redelivery a
+no-op on the provider's side. Any tool claiming exactly-once over Telegram is wrong.
 
-- the notification row is written in the same transaction as the status change, so neither can
+What the design does guarantee:
+
+- the notification row is written in the **same transaction** as the status change, so neither can
   exist without the other;
-- `idempotency_key` is unique and derived from the audit event id, so a replayed change cannot
-  enqueue a second message;
-- rows are marked `sent` immediately after the transport confirms.
+- `idempotency_key` is unique and derived from the audit event id, so one logical change can never
+  produce two rows;
+- a worker **claims** a row — committing `status = processing` with a lease, including the worker
+  id and an expiry — **before** making any outbound call, so two workers never hold the same row;
+- if the worker holding a row dies, its lease expires and the row becomes claimable again, so a
+  crash does not strand a message;
+- rows are marked `sent` immediately after the transport confirms, committed **per message** rather
+  than per batch.
 
-**The one window that remains:** a crash between a successful send and the commit that records
-it would, on the next run, re-send once. Closing that completely needs a provider-side
-idempotency key, which the Telegram Bot API does not offer. This is documented rather than
-glossed over, and it is why the claim above says "at-least-once" and not "exactly-once".
+**The window that remains:** if a worker crashes *after* the provider accepted a message but
+*before* the `sent` commit, the lease eventually expires and the message is delivered a second
+time. That is inherent to at-least-once over a provider without idempotency keys.
+
+### Concurrency
+
+The claim is a single guarded `UPDATE`:
+
+```sql
+UPDATE outbox_messages
+   SET status='processing', claimed_by=?, lease_expires_at=?
+ WHERE id IN (SELECT id ... WHERE <claimable> ORDER BY ... LIMIT ?)
+   AND <claimable>          -- repeated deliberately
+```
+
+The repeated predicate is load-bearing. On **PostgreSQL** two statements can both pick the same id
+in their subqueries; the second blocks on the row lock, and when it proceeds PostgreSQL
+re-evaluates the outer `WHERE` against the newly committed row. Without the repeated predicate the
+row still matches by id and the second worker would overwrite the first worker's lease. On
+**SQLite** writes are serialised and a single `UPDATE` is atomic, so the second worker's subquery
+simply sees the claimed rows and skips them.
+
+**What is tested:** two workers in two threads against one SQLite file, asserting every
+notification is delivered exactly once and each message is attempted exactly once
+(`tests/test_outbox_claim.py`). Reverting the claim to a plain `SELECT` makes that test fail with
+duplicate deliveries, which is how the test was validated.
+
+**What is not tested:** PostgreSQL. The `EvalPlanQual` reasoning above is why the guard is written
+the way it is, but no PostgreSQL instance was run. Treat multi-worker operation on PostgreSQL as
+designed-for and unverified.
+
+`TALABFLOW_OUTBOX_LEASE_SECONDS` must exceed `TALABFLOW_HTTP_TIMEOUT_SECONDS`, or a slow send could
+outlive its own lease and be reclaimed mid-flight — the one way this design could duplicate a
+message. Startup refuses that combination rather than leaving it as a footgun.
 
 ## Limitations
 
@@ -292,9 +337,13 @@ glossed over, and it is why the claim above says "at-least-once" and not "exactl
    Meta app review. `MessageTransport` is the seam a WhatsApp implementation would slot into;
    nothing above it would change. Not claimed as working, because it isn't written.
 2. **Single business per deployment.** No multi-tenancy. Two shops need two deployments.
-3. **SQLite by default.** Fine for one site; `PRAGMA busy_timeout` handles the bot and worker
-   writing concurrently. For real concurrency, point `TALABFLOW_DATABASE_URL` at PostgreSQL —
-   no code change, only the URL. That path is **not** load-tested.
+3. **SQLite is the only database that has been run.** Everything in this repository — the tests,
+   the demo, the CI job — runs on SQLite, and `PRAGMA busy_timeout` handles the bot and worker
+   writing concurrently. Because persistence goes through SQLAlchemy, pointing
+   `TALABFLOW_DATABASE_URL` at PostgreSQL should need no code change, **but that has never been
+   attempted**: no PostgreSQL instance was started at any point, so the URL, the migrations and
+   the outbox claim are all unverified on it. Treat PostgreSQL as an intended target, not a
+   supported one.
 4. **Rate limits and flood control are per-process.** They reset on restart and are not shared
    between workers. Honest for a single-server deployment; a horizontally scaled one needs Redis.
 5. **Language is per-deployment, not per-customer.** `TALABFLOW_DEFAULT_LANGUAGE` picks English
@@ -302,10 +351,11 @@ glossed over, and it is why the claim above says "at-least-once" and not "exactl
 6. **No web dashboard.** The API is complete and documented; there is no UI on top of it. Staff
    use the CLI, the OpenAPI console, or a client someone builds.
 7. **No payments, no scheduling, no inventory.** Intake and tracking only.
-8. **One outbox worker at a time.** Two concurrent workers could both claim the same row; the
-   unique key prevents a *duplicate enqueue*, but not two simultaneous sends of one row. Running
-   a single worker (as compose does) avoids this; `SELECT ... FOR UPDATE SKIP LOCKED` on
-   PostgreSQL is the fix, and is in the roadmap.
+8. **Multi-worker delivery is verified on SQLite only.** Workers lease each message before sending,
+   and two concurrent workers on one SQLite file are tested not to double-send. The same guard is
+   written to be correct on PostgreSQL, but **no PostgreSQL instance was run**, so treat that as
+   designed-for and unverified. On PostgreSQL the claim does not use `SKIP LOCKED`, so under heavy
+   contention workers do redundant work — correct, but not optimal.
 9. **No message media.** Photos, voice notes and location pins are ignored; text only.
 
 ## Troubleshooting
@@ -355,9 +405,13 @@ Every row was verified by running the code.
 | Immutable audit trail per change | ✅ Verified in the demo output |
 | Transactional outbox + worker with retry/backoff/dead-letter | ✅ 17 tests |
 | Notification deduplication per event | ✅ Verified live and in tests |
+| Outbox claim + lease, so two workers never send the same message | ✅ 22 tests, including two real threads against one SQLite file. **SQLite verified; PostgreSQL designed-for but not run.** |
+| Crash recovery via lease expiry | ✅ Tested |
+| Token revocation: deactivation, deletion and demotion take effect on the next request | ✅ 4 tests |
 | Admin API: auth, RBAC, orders, status, stats, staff | ✅ 39 tests + live `curl` run |
 | XLSX / CSV export with formula-injection guard | ✅ 16 tests |
-| Alembic migrations | ✅ `upgrade`, `downgrade base`, and `alembic check` all verified |
+| Alembic migrations | ✅ `upgrade`, `downgrade`, re-`upgrade` and `alembic check` all verified, and run in CI |
+| CI (format, lint, types, tests, migrations, hygiene) | ✅ Workflow committed and valid; **never executed on GitHub** — it has not been pushed |
 | Offline scripted transport | ✅ The default; the whole suite runs on it |
 | Telegram transport | ⚠️ Implemented and tested against a mock transport — request shape, offset persistence, parsing, error classification. **Not yet run against the real Bot API**, because that needs a bot token this project does not have. |
 | Docker image + compose | ✅ Image builds; `compose up` not exercised end-to-end |
@@ -373,7 +427,10 @@ transport, but no message has been sent through real Telegram from this code.
 
 1. Run against a real bot token and record the result (closes the one ⚠️).
 2. Per-customer language detection instead of a per-deployment default.
-3. `SELECT ... FOR UPDATE SKIP LOCKED` on PostgreSQL so multiple workers are safe.
+3. Actually run PostgreSQL — migrations, the test suite, and the two-worker concurrency test —
+   so its row is no longer "designed-for but never run". Then add `FOR UPDATE SKIP LOCKED` to the
+   claim, which on PostgreSQL is a throughput optimisation rather than a correctness fix: the
+   repeated predicate already makes the claim safe.
 4. A minimal staff web dashboard over the existing API.
 5. WhatsApp Cloud API transport behind the existing interface.
 6. Scheduled appointments with reminder notifications.
@@ -399,7 +456,7 @@ src/talabflow/
 └── transports/        base (interface) · scripted (offline) · telegram (real)
 migrations/            Alembic; never imports application code
 scripts/               demo.sh, demo_conversation.py, demo_pipeline.py
-tests/                 298 tests, fully offline
+tests/                 324 tests, fully offline
 ```
 
 ## Sample data

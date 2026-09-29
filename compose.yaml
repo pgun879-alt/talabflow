@@ -2,10 +2,12 @@
 #
 #   docker compose up --build
 #
-# All three share one SQLite file on a named volume. That is fine for a single-site business and
-# is the documented default; for anything with real concurrency, point
-# TALABFLOW_DATABASE_URL at PostgreSQL (see the commented service at the bottom) -- the
-# application code needs no change, only the URL.
+# All three share one SQLite file on a named volume. That is the only configuration that has
+# actually been run: the tests, the demo and CI are all SQLite.
+#
+# A PostgreSQL service is sketched at the bottom of this file, commented out. It is a starting
+# point, not a supported path -- no PostgreSQL instance was ever started during development, so
+# nothing about it has been verified.
 
 name: talabflow
 
@@ -59,7 +61,7 @@ services:
 volumes:
   talabflow-data:
 
-# To use PostgreSQL instead, uncomment this service, add
+# UNVERIFIED. To try PostgreSQL, uncomment this service, add
 #   TALABFLOW_DATABASE_URL: postgresql+psycopg://talabflow:${POSTGRES_PASSWORD}@db:5432/talabflow
 # to x-common's environment, add `psycopg[binary]` to the dependencies, and add a
 # `db: {condition: service_healthy}` entry to each depends_on block.
