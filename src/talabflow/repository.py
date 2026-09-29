@@ -280,6 +280,20 @@ def outbox_key_for_event(event_id: int) -> str:
     return f"order-event:{event_id}"
 
 
+def find_outbox_by_key(session: Session, key: str) -> OutboxMessage | None:
+    """Look up a queued notification by idempotency key.
+
+    Split out of :func:`queue_status_notification` on purpose. This check is only a fast path --
+    the unique constraint is the actual guarantee -- and between this read and the insert another
+    process can take the key. That window is precisely what the savepoint below protects against,
+    and making the lookup a named function lets a test stub it to reproduce the race
+    deterministically instead of hoping to hit it by timing.
+    """
+    return session.scalars(
+        select(OutboxMessage).where(OutboxMessage.idempotency_key == key)
+    ).one_or_none()
+
+
 def queue_status_notification(
     session: Session, *, order: Order, event: OrderEvent, language: Language = "en"
 ) -> OutboxMessage | None:
@@ -289,10 +303,7 @@ def queue_status_notification(
     path, not an error.
     """
     key = outbox_key_for_event(event.id)
-    existing = session.scalars(
-        select(OutboxMessage).where(OutboxMessage.idempotency_key == key)
-    ).one_or_none()
-    if existing is not None:
+    if find_outbox_by_key(session, key) is not None:
         logger.debug("notification for event %d already queued", event.id)
         return None
 
@@ -315,13 +326,22 @@ def queue_status_notification(
         chat_id=customer.chat_id,
         body=body,
     )
-    session.add(message)
+    # The insert runs inside a SAVEPOINT so that losing the unique-key race rolls back *only*
+    # this insert.
+    #
+    # The previous version called session.rollback() here, which rolls back the entire outer
+    # transaction -- and that transaction also contains the order's new status and its OrderEvent
+    # audit row. A concurrent duplicate enqueue would therefore have silently discarded a status
+    # change that the caller had already been told succeeded. A savepoint keeps the caller's work
+    # and leaves the outer transaction usable.
     try:
-        session.flush()
+        with session.begin_nested():
+            session.add(message)
+            session.flush()
     except IntegrityError:
-        # Another worker or request queued it between the check and the insert. The unique
-        # constraint is the real guarantee; this branch just makes the race harmless.
-        session.rollback()
+        # Another worker or request inserted the same idempotency_key between the check above and
+        # this insert. The unique constraint is the real guarantee; this branch only makes losing
+        # the race harmless.
         logger.info("notification for event %d was queued concurrently", event.id)
         return None
     return message

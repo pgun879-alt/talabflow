@@ -1,7 +1,12 @@
-"""Tests for outbox claiming, leases and crash recovery.
+"""Tests for outbox claiming, leases, and the savepoint around the duplicate-enqueue race.
 
-``claim_due_outbox_messages`` was a plain ``SELECT``, so two workers read the same due rows and
-both sent them. A worker now leases a row and commits that lease before sending.
+These cover the two defects this module was rewritten to fix:
+
+1. **No claim.** ``claim_due_outbox_messages`` was a plain ``SELECT``, so two workers read the same
+   due rows and both sent them. Now a worker leases a row and commits the lease before sending.
+2. **Transaction-wide rollback.** ``queue_status_notification`` called ``session.rollback()`` when
+   it lost the unique-key race, which rolled back the *caller's* transaction -- including the order
+   status change and its audit event. Now the insert is wrapped in a SAVEPOINT.
 
 The concurrency tests use real threads against a real SQLite file, because the bug only appears
 when two connections race.
@@ -13,14 +18,16 @@ import threading
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import Engine, create_engine, event, select
+from sqlalchemy import Engine, create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from talabflow import repository
 from talabflow.config import Settings
 from talabflow.db import build_session_factory, create_all, session_scope
 from talabflow.models import (
+    Customer,
     Order,
+    OrderEvent,
     OrderStatus,
     OutboxMessage,
     OutboxStatus,
@@ -344,6 +351,193 @@ def test_two_concurrent_workers_never_send_the_same_message_twice(
     assert sum(row.attempts for row in rows) == message_count, (
         "each message should have been attempted exactly once"
     )
+
+
+# ------------------------------------------------------------- savepoint on duplicate
+
+
+def test_losing_the_duplicate_race_keeps_the_status_change_and_audit_event(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Regression test for the transaction-wide rollback.
+
+    ``queue_status_notification`` used to call ``session.rollback()`` when the unique key was
+    already taken. That rolled back the *caller's* transaction too -- discarding the order's new
+    status and its audit event, after the caller had been told the change succeeded.
+
+    Here the notification is pre-inserted so the second insert loses the race. The status change
+    and the audit event must survive, the outer transaction must stay usable, and exactly one
+    outbox row must exist.
+    """
+    with session_scope(session_factory) as session:
+        order = _seed_order(session)
+        reference = order.reference
+
+        # Advance the order, which writes the audit event and queues the notification.
+        event_row = repository.change_order_status(
+            session, order=order, to_status=OrderStatus.CONFIRMED, actor="amina"
+        )
+        assert order.status is OrderStatus.CONFIRMED
+
+        # Now deliberately re-queue the same event. This is the losing side of the race.
+        duplicate = repository.queue_status_notification(session, order=order, event=event_row)
+        assert duplicate is None, "a duplicate enqueue must be a no-op"
+
+        # The outer transaction must still be usable after the savepoint rollback.
+        session.flush()
+
+    # Everything the caller did survived the commit.
+    with session_scope(session_factory) as session:
+        order = repository.get_order_by_reference(session, reference)
+        assert order is not None
+        assert order.status is OrderStatus.CONFIRMED, "the status change must not be rolled back"
+
+        events = repository.load_order_events(session, order.id)
+        assert [e.to_status for e in events] == [OrderStatus.NEW, OrderStatus.CONFIRMED]
+        assert events[-1].actor == "amina", "the audit event must not be rolled back"
+
+        total = session.scalar(select(func.count()).select_from(OutboxMessage))
+        assert total == 1, "the unique constraint must leave exactly one notification"
+
+
+def test_a_duplicate_inserted_by_another_connection_is_absorbed(
+    session_factory: sessionmaker[Session], engine: Engine
+) -> None:
+    """The same property, with the duplicate genuinely written by a *different* connection.
+
+    The rival commits its row first; our later transaction then loses the unique-key race at flush
+    time and must absorb it without discarding its own work.
+
+    Note the shape of this test. The rival cannot insert *while* our transaction holds a write
+    lock, because SQLite permits exactly one writer -- attempting it simply blocks until
+    ``busy_timeout`` expires. That is a property of the database, not of this code, and it is the
+    same property the claim logic relies on. So the rival writes first, which is the state our
+    transaction would observe anyway.
+    """
+    with session_scope(session_factory) as setup:
+        order = _seed_order(setup)
+        reference = order.reference
+        # Take the audit event now, suppressing the notification so the key is still free.
+        event_row = repository.change_order_status(
+            setup, order=order, to_status=OrderStatus.CONFIRMED, actor="amina", notify=False
+        )
+        setup.flush()
+        key = repository.outbox_key_for_event(event_row.id)
+        event_id = event_row.id
+
+    # A different connection queues that key first, and commits.
+    rival_factory = build_session_factory(engine)
+    with session_scope(rival_factory) as rival:
+        rival.add(
+            OutboxMessage(
+                idempotency_key=key,
+                order_id=rival.scalars(select(Order)).one().id,
+                channel="scripted",
+                chat_id="1001",
+                body="queued by another worker",
+            )
+        )
+
+    # Now our transaction does some work and then loses the race.
+    with session_scope(session_factory) as session:
+        order = repository.get_order_by_reference(session, reference)
+        assert order is not None
+        event_row = next(
+            e for e in repository.load_order_events(session, order.id) if e.id == event_id
+        )
+
+        # Caller work that must survive: advance the order again, with its own audit event.
+        repository.change_order_status(
+            session, order=order, to_status=OrderStatus.IN_PROGRESS, actor="karim", notify=False
+        )
+
+        # This insert hits the unique constraint the rival already took.
+        assert repository.queue_status_notification(session, order=order, event=event_row) is None
+
+        # The outer transaction is still usable after the savepoint rollback.
+        session.flush()
+
+    with session_scope(session_factory) as session:
+        order = repository.get_order_by_reference(session, reference)
+        assert order is not None
+        assert order.status is OrderStatus.IN_PROGRESS, "caller work must survive the lost race"
+        assert len(repository.load_order_events(session, order.id)) == 3
+        assert session.scalar(select(func.count()).select_from(OutboxMessage)) == 1
+
+
+def test_losing_the_insert_race_does_not_roll_back_the_callers_transaction(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The decisive test: force the ``IntegrityError`` path and prove the caller's work survives.
+
+    The other duplicate tests exit early via the existence fast-path and never reach the insert,
+    so they cannot detect the old ``session.rollback()``. Here the fast-path lookup is stubbed to
+    report "nothing queued" while the row really is there, which is exactly the state a caller is
+    in when another process takes the key between the check and the flush. The insert then fails
+    on the unique constraint.
+
+    With ``session.rollback()`` the whole outer transaction -- the status change and its audit
+    event -- is discarded, after the caller was told the change succeeded. With a SAVEPOINT only
+    the insert is undone.
+    """
+    with session_scope(session_factory) as session:
+        order = _seed_order(session)
+        reference = order.reference
+        event_row = repository.change_order_status(
+            session, order=order, to_status=OrderStatus.CONFIRMED, actor="amina"
+        )
+        key = repository.outbox_key_for_event(event_row.id)
+        assert repository.find_outbox_by_key(session, key) is not None
+
+    with session_scope(session_factory) as session:
+        order = repository.get_order_by_reference(session, reference)
+        assert order is not None
+        event_row = repository.load_order_events(session, order.id)[-1]
+
+        # Caller work that must survive the lost race.
+        repository.change_order_status(
+            session, order=order, to_status=OrderStatus.IN_PROGRESS, actor="karim", notify=False
+        )
+        session.flush()
+
+        # Pretend the key looked free, as it would have moments before a rival took it.
+        monkeypatch.setattr(repository, "find_outbox_by_key", lambda _session, _key: None)
+        assert repository.queue_status_notification(session, order=order, event=event_row) is None
+
+        # The outer transaction must still be usable.
+        session.flush()
+
+    with session_scope(session_factory) as session:
+        order = repository.get_order_by_reference(session, reference)
+        assert order is not None
+        assert order.status is OrderStatus.IN_PROGRESS, (
+            "the caller's status change must survive a lost duplicate-insert race"
+        )
+        events = repository.load_order_events(session, order.id)
+        assert [e.to_status for e in events] == [
+            OrderStatus.NEW,
+            OrderStatus.CONFIRMED,
+            OrderStatus.IN_PROGRESS,
+        ], "the audit trail must survive a lost duplicate-insert race"
+        assert session.scalar(select(func.count()).select_from(OutboxMessage)) == 1
+
+
+def test_order_and_event_rows_are_intact_after_a_duplicate_race(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Belt and braces: the counts themselves, not just the objects in the session."""
+    with session_scope(session_factory) as session:
+        order = _seed_order(session)
+        event_row = repository.change_order_status(
+            session, order=order, to_status=OrderStatus.CONFIRMED, actor="amina"
+        )
+        repository.queue_status_notification(session, order=order, event=event_row)
+
+    with session_scope(session_factory) as session:
+        assert session.scalar(select(func.count()).select_from(Order)) == 1
+        assert session.scalar(select(func.count()).select_from(OrderEvent)) == 2
+        assert session.scalar(select(func.count()).select_from(Customer)) == 1
+        assert session.scalar(select(func.count()).select_from(OutboxMessage)) == 1
 
 
 # ------------------------------------------------------------------ SQLite behaviour
