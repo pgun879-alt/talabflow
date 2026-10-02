@@ -59,7 +59,6 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 PLACEHOLDER_MARKERS: tuple[str, ...] = (
     "replace-me",
     "change-me",
-    "<github-username>",
     "your-token",
     "placeholder",
     "PLACEHOLDER",

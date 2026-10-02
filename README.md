@@ -96,7 +96,7 @@ mid-order and the customer continues from where they were.
 ## Quickstart
 
 ```bash
-git clone https://github.com/<github-username>/talabflow.git && cd talabflow
+git clone https://github.com/pgun879-alt/talabflow.git && cd talabflow
 make setup
 make demo
 ```
