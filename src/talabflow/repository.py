@@ -225,15 +225,20 @@ def list_orders(
     if status is not None:
         filters.append(Order.status == status)
     if search:
-        # A bound LIKE pattern: the wildcards are ours, the value stays a parameter.
-        pattern = f"%{search.strip()}%"
+        # A bound LIKE pattern: the wildcards are ours, the value stays a parameter. Binding
+        # alone stops SQL injection but not LIKE's own wildcards -- an unescaped "%" in the search
+        # term would match every order -- so those are escaped as well.
+        term = search.strip()
+        for special in ("\\", "%", "_"):
+            term = term.replace(special, "\\" + special)
+        pattern = f"%{term}%"
         filters.append(
             or_(
-                Order.reference.ilike(pattern),
-                Order.service_type.ilike(pattern),
-                Order.details.ilike(pattern),
-                Order.contact_phone.ilike(pattern),
-                Order.address.ilike(pattern),
+                Order.reference.ilike(pattern, escape="\\"),
+                Order.service_type.ilike(pattern, escape="\\"),
+                Order.details.ilike(pattern, escape="\\"),
+                Order.contact_phone.ilike(pattern, escape="\\"),
+                Order.address.ilike(pattern, escape="\\"),
             )
         )
 
