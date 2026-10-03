@@ -11,7 +11,7 @@ bot token and no network.**
 
 [![CI](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml/badge.svg)](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-362%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-489%20passing-brightgreen)](#testing)
 [![Types](https://img.shields.io/badge/mypy-clean-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -42,9 +42,10 @@ puts a real system behind it.
 
 | | Typical tutorial bot | `talabflow` |
 |---|---|---|
-| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 362 tests, zero network calls |
+| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 489 tests, zero network calls |
 | Conversation state | A dict in memory, lost on restart | Persisted per customer; a half-finished order survives a restart |
 | Unscripted input | Breaks on anything unexpected | Explicit state machine; every invalid value re-prompts |
+| Phone numbers | Anything with enough digits | Checked against the numbering plan of the number's **own country**, stored in one canonical form, and marked *verified* when the customer shares their own contact — see [Phone numbers](#phone-numbers) |
 | Status changes | `UPDATE orders SET status=...` | Guarded transitions + an immutable audit event per change |
 | Customer notifications | `send_message()` inline, lost on crash | **Transactional outbox** written in the same transaction, delivered by a worker with retry, backoff and dead-lettering |
 | Duplicate messages | Likely | Deduplicated by a unique key derived from the event id |
@@ -129,6 +130,8 @@ The only step that needs anything external. `@BotFather` issues tokens for free.
 ```bash
 TALABFLOW_TRANSPORT=telegram
 TALABFLOW_TELEGRAM_BOT_TOKEN=123456789:your-token-from-botfather
+# Your country, so customers can type their number the way they dial it. See "Phone numbers".
+TALABFLOW_PHONE_DEFAULT_REGION=DZ
 ```
 
 3. Run the two processes:
@@ -237,6 +240,8 @@ Configuration is validated at startup and **refuses to run in an unsafe state**:
 | `ENVIRONMENT=production` with `CORS_ALLOW_ORIGINS=*` | Startup fails |
 | The admin API started with the placeholder secret, or one under 32 characters, in **any** environment | The API refuses to start. The bot, the worker and the demo never use the secret and are unaffected |
 | Empty or duplicated `SERVICE_TYPES` | Startup fails — duplicates would make two menu numbers mean the same thing |
+| `PHONE_DEFAULT_REGION` or `PHONE_ALLOWED_REGIONS` holding something that is not a country code (`Algeria`, `213`, `ZZ`) | Startup fails and names the bad value — otherwise the typo would surface as every customer's number being refused |
+| `PHONE_DEFAULT_REGION` not listed in a non-empty `PHONE_ALLOWED_REGIONS` | Startup fails — every number typed the local way would be read as a country that is not accepted |
 
 Development stays permissive otherwise, so none of this makes local work painful: the offline
 demo, the bot and the worker need no secret at all.
@@ -251,7 +256,7 @@ make test
 Verified on Python 3.13.9, Linux, by running these commands after the most recent change:
 
 ```
-362 passed                                       # pytest
+489 passed                                       # pytest
 Success: no issues found in 19 source files      # mypy
 All checks passed!                               # ruff check
 41 files already formatted                       # ruff format --check
@@ -271,6 +276,53 @@ repository and outbox write path, 24 on outbox claiming and the duplicate-enqueu
 (`tests/test_outbox_claim.py`), 31 on the Telegram transport, 53 on the API, 31 on security
 primitives.
 
+## Phone numbers
+
+A contact number nobody can call is a lost order, so the phone step is the strictest one in the
+conversation.
+
+**What went wrong before.** The first version accepted any 8 to 15 digits — the E.164 length range
+and nothing else. In a manual test, `98765432109876` was accepted: fourteen digits that belong to
+no country. Counting digits cannot tell a phone number from a row of keys.
+
+**How a number is read now.** Validation uses
+[`phonenumbers`](https://github.com/daviddrysdale/python-phonenumbers), the Python port of Google's
+libphonenumber, which carries the numbering plan — lengths *and* existing prefixes — of every
+country.
+
+| The customer sends | How it is read |
+|---|---|
+| `+212 612-345678`, `00212612345678` | The country code names the country (Morocco), and the number is checked against **that** country's plan, wherever the business is |
+| `0555 12 34 56` | No country in it, so it is read as a number of `TALABFLOW_PHONE_DEFAULT_REGION` |
+| `0555 12 34 56` with no default region set | Refused with a request to add the country code. The same digits are a valid number in more than one country, and guessing would store a confidently wrong one |
+| `٠٥٥٥١٢٣٤٥٦`, `0555-12-34-56`, `(0555) 12 34 56` | Accepted: Arabic-Indic and Persian digits and ordinary punctuation are formatting, not errors |
+| `98765432109876`, `0155123456`, `0555abc456`, `+800 1234 5678` | Refused: wrong length for the country, a prefix that does not exist, letters, or a line type nobody is reached on (freephone, premium rate, short codes) |
+
+Every accepted number is stored as E.164 (`+213555123456`), so each customer's number has exactly
+one spelling to search, export and dial. It is read back grouped (`+213 555 12 34 56`) in the
+confirmation, where a mistyped digit is easy to spot. A refusal always comes with an example of a
+valid number for the configured country. Staff search finds a stored number however it is typed:
+`0555 12 34 56`, `+213 555…`, or just its last digits.
+
+`TALABFLOW_PHONE_ALLOWED_REGIONS=DZ,MA,TN` restricts contact numbers to the listed countries.
+Empty — the default — accepts a valid number from anywhere.
+
+**Verified numbers.** On Telegram the phone question comes with a *Share my phone number* button.
+Tapping it sends the number registered to the customer's own Telegram account, and the order is
+stored with `contact_phone_verified = true` — shown in the API, the CLI (`✓`) and the export.
+A typed number, or a contact card for somebody else, is accepted when valid and stored as not
+verified.
+
+**What this does not prove.**
+
+- A number that passes is one that *can exist* under its country's plan. It is not proof the line
+  is in service, and a customer can still type a real number that is not theirs.
+- "Verified" means Telegram reported the shared contact as the sender's own account
+  (`contact.user_id == from.id`), which is the check the Bot API offers. It is not a call-back or
+  an SMS code.
+- Numbers stored before this validation existed are left exactly as they were. Converting them
+  would mean guessing a country for each one.
+
 ## Security
 
 | Concern | How it is handled |
@@ -281,11 +333,12 @@ primitives.
 | Login brute force | `POST /v1/auth/token` is throttled per account (`LOGIN_ATTEMPTS_PER_MINUTE`, default 10) and per client address, **before** any password hashing, and returns 429 with `Retry-After`. The general API limit is keyed on a verified token, so it cannot protect the endpoint that issues tokens. Trade-off: someone who knows a username can keep that account from signing in while they keep sending requests; tokens already issued keep working. |
 | Signing secret | The admin API refuses to start with the `.env.example` placeholder or a secret under 32 characters, **in any environment**. `development` is the default environment, so checking only in production would let a forgotten setting run with a published secret — enough to forge an admin token without a password. |
 | Authorisation | Role checks are FastAPI dependencies, so forgetting one makes a route *unreachable* rather than public. |
+| Contact numbers | Validated against the numbering plan of the number's own country before an order can be created, so a made-up string of digits never reaches staff. See [Phone numbers](#phone-numbers) for what that does and does not prove. |
 | Order privacy | The customer-facing `/status` lookup is scoped to the requesting customer. Without that, anyone who guessed or overheard a reference could read another customer's phone number and address. Tested. |
 | Reference guessing | References use `secrets`, not `random`. A predictable reference would let someone enumerate orders. |
 | SQL injection | SQLAlchemy ORM throughout; search uses a bound `LIKE` parameter, with a test asserting that `'; DROP TABLE orders; --` matches nothing and the table survives. `LIKE`'s own wildcards are escaped too, so a search for `%` does not match every order. |
 | Group chats | Messages from groups, supergroups and channels are ignored. The intake conversation echoes a phone number and address back for confirmation, and status notifications go to the chat the customer last wrote from — in a group that would publish both. |
-| Spreadsheet formula injection | A customer can type `=HYPERLINK("http://evil","click")` into a chat field. Excel and LibreOffice evaluate that when staff open the export — free-text field to code execution on the buyer's machine. Leading formula triggers are prefixed with an apostrophe. Tested for both CSV and XLSX. |
+| Spreadsheet formula injection | A customer can type `=HYPERLINK("http://evil","click")` into a chat field. Excel and LibreOffice evaluate that when staff open the export — free-text field to code execution on the buyer's machine. Leading formula triggers are prefixed with an apostrophe. Tested for both CSV and XLSX. The one exemption is a stored phone number — a plus sign followed only by digits, which cannot call a function or reference a cell. |
 | Markup injection | Telegram messages are sent with **no `parse_mode`**, because confirmations echo customer text back. |
 | Flood control | Per-customer sliding window on inbound messages; per-user on the API, returning 429 with `Retry-After`. |
 | Secrets | Never committed. `.env`, `data/`, `*.sqlite3` are git-ignored; `.env.example` holds placeholders. Secret fields use `repr=False`. The Alembic config reads the database URL from the environment so a connection string with a password is never in a committed file. |
@@ -391,6 +444,10 @@ message. Startup refuses that combination rather than leaving it as a footgun.
 11. **A password reset does not cancel tokens already issued.** They expire on their own, within
     the token lifetime (60 minutes by default). Deactivating the account cuts access on the next
     request.
+12. **A valid phone number is not a reachable one.** Validation proves a number fits its
+    country's numbering plan; it does not prove the line is in service or belongs to the customer.
+    Only a number shared through Telegram's own-contact button is marked verified, and that button
+    exists on Telegram only. There is no SMS or call-back verification.
 
 ## Troubleshooting
 
@@ -434,7 +491,9 @@ Every row was verified by running the code.
 
 | Feature | Status |
 |---|---|
-| Intake conversation state machine, persisted per customer | ✅ 55 tests |
+| Intake conversation state machine, persisted per customer | ✅ 66 tests |
+| Phone validation per country, E.164 storage, search by any spelling | ✅ 69 tests of the validator alone, plus conversation, search, export and API tests. Runs on libphonenumber's numbering data, offline |
+| *Share my phone number* button and the verified flag | ⚠️ Tested offline and against a mock Bot API (keyboard payload, own card vs somebody else's). Not yet exercised against real Telegram |
 | Order references (unambiguous alphabet, confusable correction) | ✅ 26 tests |
 | Status pipeline with guarded transitions | ✅ Tested, including every refusal |
 | Immutable audit trail per change | ✅ Verified in the demo output |
@@ -443,10 +502,10 @@ Every row was verified by running the code.
 | Outbox claim + lease, so two workers never send the same message | ✅ 24 tests, including two real threads against one database and a worker losing its lease mid-batch. **Verified on SQLite and on PostgreSQL 16 in CI.** |
 | Crash recovery via lease expiry | ✅ Tested |
 | Token revocation: deactivation, deletion and demotion take effect on the next request | ✅ 4 tests. Triggered through `PATCH /v1/staff/{username}` or `talabflow update-staff` |
-| Admin API: auth, RBAC, orders, status, stats, staff management, login throttling | ✅ 49 tests + live `curl` run |
+| Admin API: auth, RBAC, orders, status, stats, staff management, login throttling | ✅ 54 tests + live `curl` run |
 | Inbound messages acknowledged after handling; a crash mid-batch redelivers them | ✅ Tested offline and against a mock Bot API. Not exercised against real Telegram |
 | Concurrent status changes to one order: compare-and-swap, the stale request gets 409 | ✅ Tested with two sessions |
-| XLSX / CSV export with formula-injection guard | ✅ 16 tests |
+| XLSX / CSV export with formula-injection guard | ✅ 23 tests |
 | Alembic migrations | ✅ `upgrade`, `downgrade`, re-`upgrade` and `alembic check` all verified, and run in CI |
 | CI (format, lint, types, tests, migrations, hygiene) | ✅ Workflow committed and valid. Its real status is the CI badge at the top of this file, which reports whatever GitHub last ran — including "no runs yet" |
 | Offline scripted transport | ✅ The default; the whole suite runs on it |
@@ -482,6 +541,7 @@ src/talabflow/
 ├── db.py              Engine, session factory, SQLite pragmas
 ├── repository.py      Data access + the transactional-outbox write path
 ├── conversation.py    The intake state machine
+├── phones.py          Phone validation per country (libphonenumber), E.164
 ├── messages.py        Customer-facing templates (en + ar)
 ├── references.py      Order reference generation and normalisation
 ├── bot.py             Poll loop: flood control, one transaction per message
@@ -493,7 +553,7 @@ src/talabflow/
 └── transports/        base (interface) · scripted (offline) · telegram (real)
 migrations/            Alembic; never imports application code
 scripts/               demo.sh, demo_conversation.py, demo_pipeline.py
-tests/                 362 tests, fully offline
+tests/                 489 tests, fully offline
 ```
 
 ## Sample data

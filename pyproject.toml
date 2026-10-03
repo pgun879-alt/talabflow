@@ -21,6 +21,9 @@ dependencies = [
   "httpx>=0.27,<1.0",
   "PyJWT>=2.8,<3.0",
   "openpyxl>=3.1,<4.0",
+  # The "lite" build: the same per-country validation rules without the geocoding, carrier and
+  # timezone data, which this project never reads.
+  "phonenumberslite>=8.13,<10.0",
   "typer>=0.12,<1.0",
   "rich>=13.7,<15.0",
 ]
