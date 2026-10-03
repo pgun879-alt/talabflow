@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final
@@ -36,6 +37,11 @@ MIN_DETAILS_LENGTH: Final = 8
 MIN_PHONE_DIGITS: Final = 8
 MAX_PHONE_DIGITS: Final = 15
 MIN_ADDRESS_LENGTH: Final = 5
+
+#: No menu has anywhere near this many entries. The cap exists because ``int()`` refuses very
+#: long digit strings outright (Python's integer-conversion length limit), and a customer who
+#: pastes a wall of digits must get a re-prompt, not an exception.
+_MAX_MENU_DIGITS: Final = 6
 
 #: Digits, spaces, and the punctuation people put in phone numbers.
 _PHONE_ALLOWED: Final = re.compile(r"^[\d\s+()\-.]+$")
@@ -92,12 +98,18 @@ def normalise_phone(raw: str) -> str | None:
     '0555123456'
     >>> normalise_phone("+213 (555) 123-456")
     '+213555123456'
+    >>> normalise_phone("٠٥٥٥ ١٢ ٣٤ ٥٦")
+    '0555123456'
     >>> normalise_phone("call me maybe")
+
+    Digits are stored as ASCII whatever script they were typed in. The digit pattern matches every
+    Unicode decimal digit, so an Arabic-Indic number is accepted -- as it should be -- but storing
+    it verbatim would mean staff searching for ``0555`` never find it.
     """
     candidate = raw.strip()
     if not candidate or not _PHONE_ALLOWED.match(candidate):
         return None
-    digits = "".join(_DIGITS.findall(candidate))
+    digits = "".join(str(unicodedata.decimal(digit)) for digit in _DIGITS.findall(candidate))
     if not (MIN_PHONE_DIGITS <= len(digits) <= MAX_PHONE_DIGITS):
         return None
     return f"+{digits}" if candidate.startswith("+") else digits
@@ -106,7 +118,12 @@ def normalise_phone(raw: str) -> str | None:
 def _resolve_service(text: str, services: tuple[str, ...]) -> str | None:
     """Accept either the menu number or the service name (case-insensitive)."""
     stripped = text.strip()
-    if stripped.isdigit():
+    # ``isdecimal``, not ``isdigit``: the latter is also true for characters such as "²" and
+    # "①", which ``int()`` cannot parse -- the exception would escape and the customer would get
+    # no reply. ``isdecimal`` is exactly the set ``int()`` accepts, Arabic-Indic digits included.
+    if stripped.isdecimal():
+        if len(stripped) > _MAX_MENU_DIGITS:
+            return None
         index = int(stripped)
         if 1 <= index <= len(services):
             return services[index - 1]
