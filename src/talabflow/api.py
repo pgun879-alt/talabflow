@@ -282,6 +282,12 @@ def create_app(settings: Settings | None = None, *, create_schema: bool = False)
         create_all(engine)
     session_factory = build_session_factory(engine)
     limiter = SlidingWindowRateLimiter(limit=resolved.api_rate_limit_per_minute)
+    # Login gets its own, much tighter, limiters. `limiter` above is keyed on a verified token,
+    # so it cannot protect the endpoint that issues tokens. The per-host ceiling is higher than
+    # the per-account one because several members of staff may share one office address or sit
+    # behind one reverse proxy.
+    login_limiter = SlidingWindowRateLimiter(limit=resolved.login_attempts_per_minute)
+    login_host_limiter = SlidingWindowRateLimiter(limit=resolved.login_attempts_per_minute * 5)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -360,7 +366,30 @@ def create_app(settings: Settings | None = None, *, create_schema: bool = False)
     # ----------------------------------------------------------------- auth
 
     @app.post("/v1/auth/token", response_model=TokenResponse, tags=["auth"])
-    def issue_token(body: TokenRequest, session: Db) -> TokenResponse:
+    def issue_token(body: TokenRequest, request: Request, session: Db) -> TokenResponse:
+        # Throttle before any password hashing. Every attempt counts, successful or not: counting
+        # only failures would mean reading the outcome first, and the point is to refuse the
+        # guess without evaluating it. scrypt is deliberately expensive, so this also stops the
+        # endpoint being used to burn CPU.
+        #
+        # The trade-off, stated plainly: someone who knows a username can keep that account from
+        # signing in for as long as they keep sending requests. Tokens already issued keep
+        # working, and the alternative -- unlimited guesses -- is worse.
+        account = body.username.strip().lower()
+        host = request.client.host if request.client else "unknown"
+        for throttle, identity in (
+            (login_limiter, f"login-account:{account}"),
+            (login_host_limiter, f"login-host:{host}"),
+        ):
+            allowed, retry_after = throttle.check(identity)
+            if not allowed:
+                logger.warning("login throttled", extra={"username": account, "host": host})
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="too many login attempts; try again later",
+                    headers={"Retry-After": str(max(int(retry_after), 1))},
+                )
+
         user = repository.get_staff_user(session, body.username)
         # One identical error for "no such user", "wrong password" and "deactivated": telling
         # them apart lets an attacker enumerate valid usernames.

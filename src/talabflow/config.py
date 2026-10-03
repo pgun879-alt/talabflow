@@ -101,6 +101,14 @@ class Settings(BaseSettings):
 
     # --- admin API ---------------------------------------------------------------
     api_rate_limit_per_minute: int = Field(default=120, ge=1, le=10_000)
+    login_attempts_per_minute: int = Field(
+        default=10,
+        ge=1,
+        le=600,
+        description="Login attempts allowed per account per minute, counted whether or not they "
+        "succeed. The general API limit only applies after a token is verified, so without this "
+        "the login endpoint would accept unlimited password guesses.",
+    )
     cors_allow_origins: CommaSeparated = ()
 
     # --- logging -----------------------------------------------------------------
