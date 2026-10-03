@@ -18,6 +18,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.sql.elements import ColumnElement
 
 from .messages import Language, render, status_label
@@ -50,6 +51,15 @@ class OrderNotFoundError(LookupError):
 
 class InvalidTransitionError(ValueError):
     """The requested status change is not allowed from the order's current status."""
+
+
+class ConcurrentStatusChangeError(InvalidTransitionError):
+    """The order's status changed between this caller reading it and trying to change it.
+
+    A subclass of :class:`InvalidTransitionError` on purpose: to the caller it is the same
+    situation -- the transition they asked for is not valid from where the order *now* is -- and
+    the API already maps that to ``409 Conflict``.
+    """
 
 
 class DuplicateUserError(ValueError):
@@ -243,6 +253,8 @@ def change_order_status(
     Raises:
         InvalidTransitionError: if the transition is not in :data:`ALLOWED_TRANSITIONS`. The
             message names the permitted targets so the caller need not guess.
+        ConcurrentStatusChangeError: if someone else changed the order's status after ``order``
+            was loaded. Nothing is written in that case.
     """
     current = order.status
     allowed = ALLOWED_TRANSITIONS.get(current, frozenset())
@@ -253,8 +265,33 @@ def change_order_status(
             f"allowed from {current.value}: {permitted}"
         )
 
-    order.status = to_status
-    order.updated_at = utcnow()
+    # Compare-and-swap, not a plain assignment. The check above ran against the copy of the order
+    # this caller loaded, which may be stale: two members of staff can load the same ``ready``
+    # order, and if one cancels it the other's "completed" is still valid *from ready*. Writing
+    # it unconditionally would bring a cancelled order back to life, record two changes out of
+    # the same status, and notify the customer of both.
+    #
+    # Putting the expected status in the WHERE clause makes the database the arbiter. SQLite
+    # serialises writers; PostgreSQL blocks the second UPDATE on the row lock and then re-checks
+    # the predicate against the committed row. Either way exactly one of them matches.
+    moment = utcnow()
+    swapped = session.execute(
+        update(Order)
+        .where(Order.id == order.id, Order.status == current)
+        .values(status=to_status, updated_at=moment)
+        .execution_options(synchronize_session=False)
+    )
+    if int(cast("CursorResult[Any]", swapped).rowcount or 0) != 1:
+        session.refresh(order)
+        raise ConcurrentStatusChangeError(
+            f"order {order.reference} was changed by someone else while this request was in "
+            f"progress: it is now {order.status.value}, not {current.value}. Reload it and try "
+            "again"
+        )
+    # The row is already updated; bring the loaded object in line without marking it dirty, so
+    # the unit of work does not issue a second, unconditional UPDATE at flush.
+    set_committed_value(order, "status", to_status)
+    set_committed_value(order, "updated_at", moment)
     event = OrderEvent(
         order_id=order.id, from_status=current, to_status=to_status, actor=actor, note=note
     )
