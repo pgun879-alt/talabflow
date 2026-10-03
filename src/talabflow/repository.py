@@ -44,6 +44,11 @@ logger = logging.getLogger(__name__)
 #: How many times to retry on a reference collision before giving up.
 _REFERENCE_ATTEMPTS = 8
 
+#: Width of ``customers.display_name``. A transport can hand over a longer name than this --
+#: Telegram allows 64 characters each for a first and last name, 129 with the space -- and
+#: PostgreSQL enforces the column length where SQLite silently does not.
+_MAX_DISPLAY_NAME = 128
+
 
 class OrderNotFoundError(LookupError):
     """No order matches the supplied reference."""
@@ -83,6 +88,10 @@ def get_or_create_customer(
     session: Session, *, channel: str, channel_user_id: str, chat_id: str, display_name: str | None
 ) -> Customer:
     """Find the customer for this channel identity, creating them on first contact."""
+    if display_name:
+        # Truncate rather than fail: a name is cosmetic, and an insert that fails on it would
+        # leave the customer with no reply at all.
+        display_name = display_name[:_MAX_DISPLAY_NAME]
     customer = session.scalars(
         select(Customer).where(
             Customer.channel == channel, Customer.channel_user_id == channel_user_id
