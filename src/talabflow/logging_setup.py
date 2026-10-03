@@ -72,3 +72,9 @@ def configure_logging(level: str = "INFO", *, json_output: bool = True) -> None:
     root.addHandler(handler)
     # Uvicorn's access log duplicates information our own middleware records.
     logging.getLogger("uvicorn.access").propagate = False
+    # httpx logs every request line at INFO, URL included -- and the Telegram Bot API carries the
+    # bot token in the URL path. Left at the root level, the token would be written to the log on
+    # every poll and every send. httpcore logs the same URLs at DEBUG. Both are pinned to WARNING
+    # whatever level the application itself runs at.
+    for http_logger in ("httpx", "httpcore"):
+        logging.getLogger(http_logger).setLevel(logging.WARNING)
