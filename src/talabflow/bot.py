@@ -3,6 +3,11 @@
 Each inbound message is one database transaction. If handling a message raises, that message's
 work is rolled back and the loop continues with the next one -- one malformed message must never
 take the bot down or corrupt a half-written order.
+
+Messages are acknowledged to the transport **after** they have been handled, not when they are
+received. If the process dies partway through a batch, the unhandled messages are delivered again
+on restart instead of being lost. The cost is at-least-once handling: a crash in the narrow gap
+between committing a message's work and acknowledging it means that message is handled twice.
 """
 
 from __future__ import annotations
@@ -47,6 +52,8 @@ class BotRunner:
         )
         self.flood_limiter = SlidingWindowRateLimiter(limit=settings.user_messages_per_minute)
         self._stopping = False
+        # This runner acknowledges each message itself, once it has been handled.
+        self.transport.manual_ack = True
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -135,7 +142,23 @@ class BotRunner:
                     "failed to handle a message",
                     extra={"channel": message.channel, "user": message.user_id},
                 )
+                self._apologise(message)
+            # Acknowledged only now, handled or not. Acknowledging on receipt would lose every
+            # message still waiting in this batch if the process died here. A message that
+            # *failed* is acknowledged too: replaying it for ever would let one bad message block
+            # every other customer, so the customer is asked to send it again instead.
+            # ``KeyboardInterrupt`` and ``SystemExit`` are not ``Exception``, so a shutdown
+            # mid-message skips this line and the message is delivered again on restart.
+            self.transport.acknowledge(message)
         return handled
+
+    def _apologise(self, message: InboundMessage) -> None:
+        """Tell the customer their message was not processed, rather than saying nothing."""
+        try:
+            self._send(message.chat_id, render("try_again", self.settings.default_language))
+        except Exception:
+            # The apology is best-effort; failing to send it must not break the loop either.
+            logger.exception("could not send the apology", extra={"user": message.user_id})
 
     def run_forever(
         self, *, idle_sleep_seconds: float = 1.0, max_iterations: int | None = None

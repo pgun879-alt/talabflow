@@ -135,6 +135,13 @@ _TEMPLATES: Final[dict[str, dict[Language, str]]] = {
         "en": "That message is too long. Please keep it under {limit} characters.",
         "ar": "الرسالة طويلة جدًا. الرجاء إبقاؤها أقل من {limit} حرفًا.",
     },
+    "try_again": {
+        "en": (
+            "Something went wrong on our side and your last message was not processed. "
+            "Please send it again."
+        ),
+        "ar": "حدث خطأ من جهتنا ولم تُعالَج رسالتك الأخيرة. الرجاء إرسالها مرة أخرى.",
+    },
     "rate_limited": {
         "en": "You are sending messages very quickly. Please wait a moment and try again.",
         "ar": "أنت ترسل الرسائل بسرعة كبيرة. انتظر قليلًا ثم أعد المحاولة.",
