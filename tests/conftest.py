@@ -6,6 +6,7 @@ never touches the network, never needs a bot token, and leaves nothing behind.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from talabflow.bot import BotRunner
 from talabflow.config import Settings
 from talabflow.conversation import ConversationEngine
 from talabflow.db import build_engine, build_session_factory, create_all, session_scope
-from talabflow.models import StaffRole
+from talabflow.models import Base, StaffRole
 from talabflow.outbox import OutboxWorker
 from talabflow.repository import create_staff_user
 from talabflow.transports.scripted import ScriptedTransport
@@ -31,7 +32,8 @@ STAFF_PASSWORD = "staff-password-1"
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(
-        database_url=f"sqlite:///{tmp_path / 'test.sqlite3'}",
+        database_url=os.environ.get("TALABFLOW_TEST_DATABASE_URL")
+        or f"sqlite:///{tmp_path / 'test.sqlite3'}",
         transport="scripted",
         jwt_secret="test-secret-that-is-long-enough-for-hs256",
         environment="development",
@@ -44,6 +46,9 @@ def settings(tmp_path: Path) -> Settings:
 @pytest.fixture
 def engine(settings: Settings) -> Iterator[Engine]:
     built = build_engine(settings)
+    if not settings.is_sqlite:
+        # A shared server database outlives the test, unlike a per-test SQLite file.
+        Base.metadata.drop_all(built)
     create_all(built)
     yield built
     built.dispose()
