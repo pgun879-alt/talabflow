@@ -71,6 +71,18 @@ class DuplicateUserError(ValueError):
     """A staff user with that username already exists."""
 
 
+class StaffNotFoundError(LookupError):
+    """No staff user has that username."""
+
+
+class LastAdminError(ValueError):
+    """The change would leave the system with no active admin.
+
+    Nobody could then create, reactivate or promote an account through the product at all, so the
+    change is refused rather than left to be repaired by hand in the database.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class OrderPage:
     """One page of orders plus the unfiltered total, for pagination."""
@@ -624,6 +636,58 @@ def create_staff_user(
 
     user = StaffUser(username=username, password_hash=hash_password(password), role=role)
     session.add(user)
+    session.flush()
+    return user
+
+
+def update_staff_user(
+    session: Session,
+    username: str,
+    *,
+    is_active: bool | None = None,
+    role: StaffRole | None = None,
+    password: str | None = None,
+) -> StaffUser:
+    """Deactivate or reactivate a staff user, change their role, or set a new password.
+
+    Each argument left as ``None`` is left unchanged. Deactivation and demotion take effect on
+    the user's *next request*, because the API re-reads the account on every call instead of
+    trusting the token. A new password does not cancel tokens already issued; they run out on
+    their own, within the token lifetime. Deactivate the account to cut access at once.
+
+    Raises:
+        StaffNotFoundError: if there is no such user.
+        LastAdminError: if the change would deactivate or demote the only active admin.
+        PasswordPolicyError: if the new password is too short.
+    """
+    user = get_staff_user(session, username)
+    if user is None:
+        raise StaffNotFoundError(f"no staff user named {username.strip().lower()!r}")
+
+    new_active = user.is_active if is_active is None else is_active
+    new_role = user.role if role is None else role
+    is_admin_now = user.is_active and user.role is StaffRole.ADMIN
+    stays_admin = new_active and new_role is StaffRole.ADMIN
+    if is_admin_now and not stays_admin:
+        other_admins = session.scalar(
+            select(func.count())
+            .select_from(StaffUser)
+            .where(
+                StaffUser.role == StaffRole.ADMIN,
+                StaffUser.is_active.is_(True),
+                StaffUser.id != user.id,
+            )
+        )
+        if not other_admins:
+            raise LastAdminError(
+                f"{user.username!r} is the only active admin; promote or reactivate another "
+                "admin first"
+            )
+
+    if password is not None:
+        user.password_hash = hash_password(password)
+    user.is_active = new_active
+    user.role = new_role
     session.flush()
     return user
 

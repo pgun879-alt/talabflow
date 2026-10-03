@@ -30,7 +30,12 @@ from .db import build_engine, build_session_factory, create_all
 from .exports import orders_to_csv, orders_to_xlsx
 from .logging_setup import configure_logging, safe_extra
 from .models import ALLOWED_TRANSITIONS, OrderStatus, StaffRole
-from .repository import DuplicateUserError, InvalidTransitionError
+from .repository import (
+    DuplicateUserError,
+    InvalidTransitionError,
+    LastAdminError,
+    StaffNotFoundError,
+)
 from .security import (
     PasswordPolicyError,
     SlidingWindowRateLimiter,
@@ -111,6 +116,14 @@ class CreateStaffRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64, pattern=r"^[a-zA-Z0-9._-]+$")
     password: str = Field(min_length=10, max_length=256)
     role: StaffRole = StaffRole.STAFF
+
+
+class UpdateStaffRequest(BaseModel):
+    """Every field is optional; only the ones supplied are changed."""
+
+    is_active: bool | None = None
+    role: StaffRole | None = None
+    password: str | None = Field(default=None, min_length=10, max_length=256)
 
 
 class StaffSummary(BaseModel):
@@ -337,7 +350,7 @@ def create_app(settings: Settings | None = None, *, create_schema: bool = False)
             CORSMiddleware,
             allow_origins=list(resolved.cors_allow_origins),
             allow_credentials=False,
-            allow_methods=["GET", "POST"],
+            allow_methods=["GET", "POST", "PATCH"],
             allow_headers=["Authorization", "Content-Type"],
         )
 
@@ -559,6 +572,41 @@ def create_app(settings: Settings | None = None, *, create_schema: bool = False)
         logger.info(
             "staff user created",
             extra=safe_extra(created_user=user.username, by=claims.subject),
+        )
+        return StaffSummary(
+            id=user.id, username=user.username, role=user.role.value, is_active=user.is_active
+        )
+
+    @app.patch("/v1/staff/{username}", response_model=StaffSummary, tags=["staff"])
+    def update_staff(
+        username: str, body: UpdateStaffRequest, session: Db, claims: AdminClaims
+    ) -> StaffSummary:
+        """Deactivate or reactivate an account, change its role, or set a new password.
+
+        Deactivation and demotion take effect on that user's next request. A new password does
+        not cancel tokens already issued; deactivate the account to cut access immediately.
+        """
+        changed = sorted(body.model_dump(exclude_none=True))
+        if not changed:
+            raise HTTPException(status_code=422, detail="nothing to change")
+        try:
+            user = repository.update_staff_user(
+                session,
+                username,
+                is_active=body.is_active,
+                role=body.role,
+                password=body.password,
+            )
+        except StaffNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except LastAdminError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except PasswordPolicyError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # The names of the fields that changed are logged; a new password's value never is.
+        logger.info(
+            "staff user updated",
+            extra=safe_extra(target_user=user.username, by=claims.subject, changed=changed),
         )
         return StaffSummary(
             id=user.id, username=user.username, role=user.role.value, is_active=user.is_active

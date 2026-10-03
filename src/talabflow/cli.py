@@ -17,7 +17,12 @@ from .db import build_engine, build_session_factory, create_all, session_scope
 from .logging_setup import configure_logging
 from .models import OrderStatus, StaffRole
 from .outbox import OutboxWorker
-from .repository import DuplicateUserError, InvalidTransitionError
+from .repository import (
+    DuplicateUserError,
+    InvalidTransitionError,
+    LastAdminError,
+    StaffNotFoundError,
+)
 from .security import PasswordPolicyError
 from .transports import build_transport
 
@@ -72,6 +77,53 @@ def create_staff(
             )
             console.print(f"[green]created[/] {user.username} with role {user.role.value}")
     except DuplicateUserError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from exc
+    except PasswordPolicyError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=2) from exc
+
+
+@app.command("update-staff")
+def update_staff(
+    username: Annotated[str, typer.Argument(help="Login name.")],
+    active: Annotated[
+        bool | None,
+        typer.Option(
+            "--activate/--deactivate",
+            help="Allow or block this account. A deactivated account loses API access on its "
+            "next request.",
+        ),
+    ] = None,
+    role: Annotated[str | None, typer.Option(help="New role: admin or staff.")] = None,
+    reset_password: Annotated[
+        bool, typer.Option("--reset-password", help="Prompt for a new password.")
+    ] = False,
+) -> None:
+    """Deactivate or reactivate a staff user, change their role, or reset their password."""
+    _, factory = _bootstrap()
+    new_role = None
+    if role is not None:
+        try:
+            new_role = StaffRole(role)
+        except ValueError as exc:
+            valid = ", ".join(item.value for item in StaffRole)
+            console.print(f"[red]unknown role {role!r}. Valid values: {valid}[/]")
+            raise typer.Exit(code=1) from exc
+    if active is None and new_role is None and not reset_password:
+        console.print("[yellow]nothing to change; see --help[/]")
+        raise typer.Exit(code=1)
+    password = None
+    if reset_password:
+        password = typer.prompt("New password", hide_input=True, confirmation_prompt=True)
+    try:
+        with session_scope(factory) as session:  # type: ignore[arg-type]
+            user = repository.update_staff_user(
+                session, username, is_active=active, role=new_role, password=password
+            )
+            state = "active" if user.is_active else "deactivated"
+            console.print(f"[green]updated[/] {user.username}: role {user.role.value}, {state}")
+    except (StaffNotFoundError, LastAdminError) as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1) from exc
     except PasswordPolicyError as exc:
