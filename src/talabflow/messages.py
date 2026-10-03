@@ -56,8 +56,29 @@ _TEMPLATES: Final[dict[str, dict[Language, str]]] = {
         "ar": "ما رقم الهاتف الذي نتصل بك عليه؟",
     },
     "invalid_phone": {
-        "en": "That does not look like a phone number. Please send digits only, 8 to 15 of them.",
-        "ar": "هذا لا يبدو رقم هاتف. أرسل أرقامًا فقط، من ٨ إلى ١٥ رقمًا.",
+        "en": (
+            "That does not look like a phone number we can call. Send it the way you dial it, "
+            "for example {local}, or with the country code, for example {international}."
+        ),
+        "ar": (
+            "هذا لا يبدو رقم هاتف يمكننا الاتصال به. أرسله كما تتصل به، مثل {local}، "
+            "أو مع رمز البلد، مثل {international}."
+        ),
+    },
+    "phone_needs_country_code": {
+        "en": (
+            "Please include your country code: start the number with +, "
+            "for example {international}."
+        ),
+        "ar": "الرجاء كتابة رمز البلد: ابدأ الرقم بعلامة +، مثل {international}.",
+    },
+    "phone_region_not_allowed": {
+        "en": "Sorry, we can only take phone numbers from these countries: {regions}.",
+        "ar": "عذرًا، نقبل أرقام الهاتف من هذه البلدان فقط: {regions}.",
+    },
+    "share_phone_button": {
+        "en": "Share my phone number",
+        "ar": "مشاركة رقم هاتفي",
     },
     "ask_address": {
         "en": "What is the address?",

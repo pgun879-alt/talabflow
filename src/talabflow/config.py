@@ -13,6 +13,8 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from .phones import is_supported_region
+
 TransportName = Literal["scripted", "telegram"]
 
 #: A tuple-of-strings setting supplied as a plain comma-separated environment value.
@@ -78,6 +80,18 @@ class Settings(BaseSettings):
         default=20, ge=1, le=600, description="Per-customer flood control for inbound messages."
     )
     max_message_length: int = Field(default=1000, ge=10, le=8000)
+    phone_default_region: str = Field(
+        default="",
+        description="Two-letter country code (DZ, MA, SA...) used to read a phone number typed "
+        "without a country code. A number that starts with + is always validated against its own "
+        "country. Empty means a customer must include the country code: a local number with no "
+        "country cannot be validated, and guessing one would store a confidently wrong number.",
+    )
+    phone_allowed_regions: CommaSeparated = Field(
+        default=(),
+        description="Comma-separated country codes a contact number may belong to. Empty accepts "
+        "a valid number from any country.",
+    )
 
     # --- outbox worker -----------------------------------------------------------
     outbox_batch_size: int = Field(default=20, ge=1, le=500)
@@ -114,7 +128,7 @@ class Settings(BaseSettings):
     # --- logging -----------------------------------------------------------------
     log_level: str = "INFO"
 
-    @field_validator("service_types", "cors_allow_origins", mode="before")
+    @field_validator("service_types", "cors_allow_origins", "phone_allowed_regions", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
         if isinstance(value, str):
@@ -129,6 +143,29 @@ class Settings(BaseSettings):
         if upper not in allowed:
             raise ValueError(f"log_level must be one of {sorted(allowed)}, got {value!r}")
         return upper
+
+    @field_validator("phone_default_region")
+    @classmethod
+    def _known_default_region(cls, value: str) -> str:
+        region = value.strip().upper()
+        if region and not is_supported_region(region):
+            raise ValueError(
+                "TALABFLOW_PHONE_DEFAULT_REGION must be a two-letter country code such as DZ, "
+                f"got {value!r}"
+            )
+        return region
+
+    @field_validator("phone_allowed_regions")
+    @classmethod
+    def _known_allowed_regions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        regions = tuple(dict.fromkeys(part.strip().upper() for part in value))
+        unknown = [region for region in regions if not is_supported_region(region)]
+        if unknown:
+            raise ValueError(
+                "TALABFLOW_PHONE_ALLOWED_REGIONS must list two-letter country codes such as "
+                f"DZ,MA; these are not recognised: {', '.join(unknown)}"
+            )
+        return regions
 
     @field_validator("service_types")
     @classmethod
@@ -166,6 +203,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check_coherence(self) -> Settings:
+        if (
+            self.phone_default_region
+            and self.phone_allowed_regions
+            and self.phone_default_region not in self.phone_allowed_regions
+        ):
+            raise ValueError(
+                f"TALABFLOW_PHONE_DEFAULT_REGION ({self.phone_default_region}) is not in "
+                "TALABFLOW_PHONE_ALLOWED_REGIONS, so every number typed the local way would be "
+                "refused. Add it to the allowed list or change the default"
+            )
         if self.transport == "telegram" and not self.telegram_bot_token:
             raise ValueError(
                 "TALABFLOW_TRANSPORT=telegram requires TALABFLOW_TELEGRAM_BOT_TOKEN. Use "

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Final
@@ -28,6 +29,7 @@ COLUMNS: Final[list[tuple[str, str]]] = [
     ("Service", "service_type"),
     ("Details", "details"),
     ("Phone", "contact_phone"),
+    ("Phone verified", "contact_phone_verified"),
     ("Address", "address"),
     ("Customer", "customer_name"),
     ("Channel", "channel"),
@@ -36,6 +38,9 @@ COLUMNS: Final[list[tuple[str, str]]] = [
 ]
 
 _TIMESTAMP_FORMAT: Final = "%Y-%m-%d %H:%M:%S"
+
+#: A phone number in the canonical form this application stores: a plus sign and digits.
+_E164: Final = re.compile(r"\+\d{1,15}")
 
 
 def _format_timestamp(value: datetime | None) -> str:
@@ -51,6 +56,7 @@ def order_to_row(order: Order) -> list[str]:
         "service_type": order.service_type,
         "details": order.details,
         "contact_phone": order.contact_phone,
+        "contact_phone_verified": "yes" if order.contact_phone_verified else "no",
         "address": order.address,
         "customer_name": (customer.display_name if customer else None) or "",
         "channel": customer.channel if customer else "",
@@ -67,7 +73,14 @@ def _sanitise_for_spreadsheet(value: str) -> str:
     Excel and LibreOffice will happily evaluate that when staff open the export, which turns a
     free-text field into code execution on the buyer's machine (CSV/formula injection). Prefixing
     a leading formula trigger with an apostrophe forces the cell to stay text.
+
+    One value is exempt: a phone number in canonical form, ``+213555123456``. Every order's
+    phone column starts with ``+`` now, and a plus sign followed only by digits cannot call a
+    function or reference a cell -- at worst a spreadsheet reads it as a number. Prefixing it
+    would put a stray apostrophe in front of every phone number staff copy out of the file.
     """
+    if _E164.fullmatch(value):
+        return value
     if value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
         return "'" + value
     return value

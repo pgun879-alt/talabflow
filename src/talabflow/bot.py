@@ -49,6 +49,8 @@ class BotRunner:
             business_name=settings.business_name,
             language=settings.default_language,
             max_message_length=settings.max_message_length,
+            phone_default_region=settings.phone_default_region,
+            phone_allowed_regions=settings.phone_allowed_regions,
         )
         self.flood_limiter = SlidingWindowRateLimiter(limit=settings.user_messages_per_minute)
         self._stopping = False
@@ -97,21 +99,49 @@ class BotRunner:
             state = repository.get_conversation_state(
                 session, customer, default_step=Step.IDLE.value
             )
-            result = self.engine.handle(session, customer=customer, state=state, text=message.text)
+            result = self.engine.handle(
+                session,
+                customer=customer,
+                state=state,
+                text=message.text,
+                shared_contact=message.is_contact,
+                contact_is_own=message.contact_is_sender,
+            )
+            # Copied out while the session is open; the replies are sent after the commit.
+            replies = list(result.replies)
             texts = result.texts
             reference = result.created_order.reference if result.created_order else None
 
         # Sending happens *after* the commit on purpose. Telling a customer their order number
         # before the transaction commits would be a lie if the commit then failed.
-        for text in texts:
-            self._send(message.chat_id, text)
+        for reply in replies:
+            self._send(
+                message.chat_id,
+                reply.text,
+                contact_button=reply.contact_button,
+                remove_keyboard=reply.remove_keyboard,
+            )
         if reference:
             logger.info("order created", extra={"reference": reference, "channel": message.channel})
         return texts
 
-    def _send(self, chat_id: str, text: str) -> None:
+    def _send(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        contact_button: str | None = None,
+        remove_keyboard: bool = False,
+    ) -> None:
         try:
-            self.transport.send(OutboundMessage(chat_id=chat_id, text=text))
+            self.transport.send(
+                OutboundMessage(
+                    chat_id=chat_id,
+                    text=text,
+                    contact_button=contact_button,
+                    remove_keyboard=remove_keyboard,
+                )
+            )
         except TransportError as exc:
             # A failed conversational reply is not worth queueing: by the time it were retried
             # the customer's context would be gone. Status notifications, which *do* matter

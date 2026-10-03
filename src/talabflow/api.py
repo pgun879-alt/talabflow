@@ -81,6 +81,8 @@ class OrderSummary(BaseModel):
     service_type: str
     details: str
     contact_phone: str
+    #: True only when the customer shared their own contact through the messaging app.
+    contact_phone_verified: bool
     address: str
     created_at: datetime
     updated_at: datetime
@@ -155,6 +157,7 @@ def _to_summary(order: object) -> OrderSummary:
         service_type=order.service_type,
         details=order.details,
         contact_phone=order.contact_phone,
+        contact_phone_verified=order.contact_phone_verified,
         address=order.address,
         created_at=order.created_at,
         updated_at=order.updated_at,

@@ -31,6 +31,7 @@ from sqlalchemy import (
     Text,
     TypeDecorator,
     UniqueConstraint,
+    false,
     func,
 )
 from sqlalchemy import (
@@ -214,6 +215,14 @@ class Order(Base):
     service_type: Mapped[str] = mapped_column(String(64), nullable=False)
     details: Mapped[str] = mapped_column(Text, nullable=False)
     contact_phone: Mapped[str] = mapped_column(String(32), nullable=False)
+    contact_phone_verified: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=false(),
+        comment="True only when the customer shared their own contact through the messaging "
+        "app, so the number is the one registered to the account that placed the order.",
+    )
     address: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[OrderStatus] = mapped_column(
         SAEnum(OrderStatus, native_enum=False, length=16),
@@ -348,6 +357,9 @@ class ConversationState(Base):
     draft_service_type: Mapped[str | None] = mapped_column(String(64))
     draft_details: Mapped[str | None] = mapped_column(Text)
     draft_phone: Mapped[str | None] = mapped_column(String(32))
+    draft_phone_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     draft_address: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
         UtcDateTime, nullable=False, server_default=func.now(), onupdate=func.now()
@@ -358,6 +370,7 @@ class ConversationState(Base):
         self.draft_service_type = None
         self.draft_details = None
         self.draft_phone = None
+        self.draft_phone_verified = False
         self.draft_address = None
 
     def __repr__(self) -> str:

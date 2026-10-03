@@ -9,6 +9,7 @@ row, and the worker delivers it later from durable state.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -40,6 +41,10 @@ from .references import generate_reference
 from .security import hash_password
 
 logger = logging.getLogger(__name__)
+
+#: Characters people put inside a phone number, and what is left once they are removed.
+_PHONE_FORMATTING = re.compile(r"[\s().\-]")
+_PHONE_SEARCH = re.compile(r"\+?\d{3,}")
 
 #: How many times to retry on a reference collision before giving up.
 _REFERENCE_ATTEMPTS = 8
@@ -154,6 +159,7 @@ def create_order(
     contact_phone: str,
     address: str,
     actor: str = "customer",
+    contact_phone_verified: bool = False,
 ) -> Order:
     """Create an order with its creation event, retrying on a reference collision.
 
@@ -170,6 +176,7 @@ def create_order(
                     service_type=service_type,
                     details=details,
                     contact_phone=contact_phone,
+                    contact_phone_verified=contact_phone_verified,
                     address=address,
                     status=OrderStatus.NEW,
                 )
@@ -232,15 +239,22 @@ def list_orders(
         for special in ("\\", "%", "_"):
             term = term.replace(special, "\\" + special)
         pattern = f"%{term}%"
-        filters.append(
-            or_(
-                Order.reference.ilike(pattern, escape="\\"),
-                Order.service_type.ilike(pattern, escape="\\"),
-                Order.details.ilike(pattern, escape="\\"),
-                Order.contact_phone.ilike(pattern, escape="\\"),
-                Order.address.ilike(pattern, escape="\\"),
-            )
-        )
+        matches = [
+            Order.reference.ilike(pattern, escape="\\"),
+            Order.service_type.ilike(pattern, escape="\\"),
+            Order.details.ilike(pattern, escape="\\"),
+            Order.contact_phone.ilike(pattern, escape="\\"),
+            Order.address.ilike(pattern, escape="\\"),
+        ]
+        # Phone numbers are stored in E.164 (+213555123456), but staff search the way they dial:
+        # "0555 12 34 56". Strip the formatting and the leading trunk zeros or "+" so the digits
+        # that the two forms share are what gets matched.
+        compact = _PHONE_FORMATTING.sub("", search)
+        if _PHONE_SEARCH.fullmatch(compact):
+            national = compact.lstrip("+").lstrip("0")
+            if national:
+                matches.append(Order.contact_phone.ilike(f"%{national}%"))
+        filters.append(or_(*matches))
 
     total = session.scalar(select(func.count()).select_from(Order).where(*filters)) or 0
     items = list(

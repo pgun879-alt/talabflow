@@ -179,7 +179,8 @@ def list_orders(
                 order.reference,
                 order.status.value,
                 order.service_type,
-                order.contact_phone,
+                # A tick marks a number the customer shared from their own account.
+                order.contact_phone + (" ✓" if order.contact_phone_verified else ""),
                 order.created_at.strftime("%Y-%m-%d %H:%M"),
             )
         console.print(table)

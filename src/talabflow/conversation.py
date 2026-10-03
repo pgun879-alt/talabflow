@@ -18,8 +18,6 @@ sending them, which is what makes it exhaustively testable without any transport
 from __future__ import annotations
 
 import logging
-import re
-import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final
@@ -29,23 +27,26 @@ from sqlalchemy.orm import Session
 from . import repository
 from .messages import Language, format_service_options, render, status_label
 from .models import ConversationState, Customer, Order
+from .phones import (
+    Phone,
+    PhoneError,
+    PhoneProblem,
+    describe_regions,
+    example_numbers,
+    format_international,
+    parse_phone,
+)
 from .references import normalise_reference
 
 logger = logging.getLogger(__name__)
 
 MIN_DETAILS_LENGTH: Final = 8
-MIN_PHONE_DIGITS: Final = 8
-MAX_PHONE_DIGITS: Final = 15
 MIN_ADDRESS_LENGTH: Final = 5
 
 #: No menu has anywhere near this many entries. The cap exists because ``int()`` refuses very
 #: long digit strings outright (Python's integer-conversion length limit), and a customer who
 #: pastes a wall of digits must get a re-prompt, not an exception.
 _MAX_MENU_DIGITS: Final = 6
-
-#: Digits, spaces, and the punctuation people put in phone numbers.
-_PHONE_ALLOWED: Final = re.compile(r"^[\d\s+()\-.]+$")
-_DIGITS: Final = re.compile(r"\d")
 
 #: Affirmatives accepted at the confirmation step, in both languages.
 _AFFIRMATIVE: Final[frozenset[str]] = frozenset(
@@ -69,6 +70,11 @@ class Reply:
     """One message the bot wants to send back."""
 
     text: str
+    #: Label of a one-tap "share my phone number" button to show under this message.
+    #: A transport that has no such button ignores it; typing the number always works.
+    contact_button: str | None = None
+    #: Take that button away again once the phone step is over.
+    remove_keyboard: bool = False
 
 
 @dataclass(slots=True)
@@ -84,35 +90,6 @@ class TurnResult:
     @property
     def texts(self) -> list[str]:
         return [reply.text for reply in self.replies]
-
-
-def normalise_phone(raw: str) -> str | None:
-    """Validate and canonicalise a phone number, or return ``None`` if it is not one.
-
-    Deliberately permissive about *formatting* and strict about *content*: people write
-    ``0555 12 34 56`` and ``+213-555-123456``, and both are the same number. Digit count is
-    checked against E.164 bounds rather than any country's specific pattern, because a
-    country-specific regex is the fastest way to reject a legitimate customer.
-
-    >>> normalise_phone("0555 12 34 56")
-    '0555123456'
-    >>> normalise_phone("+213 (555) 123-456")
-    '+213555123456'
-    >>> normalise_phone("٠٥٥٥ ١٢ ٣٤ ٥٦")
-    '0555123456'
-    >>> normalise_phone("call me maybe")
-
-    Digits are stored as ASCII whatever script they were typed in. The digit pattern matches every
-    Unicode decimal digit, so an Arabic-Indic number is accepted -- as it should be -- but storing
-    it verbatim would mean staff searching for ``0555`` never find it.
-    """
-    candidate = raw.strip()
-    if not candidate or not _PHONE_ALLOWED.match(candidate):
-        return None
-    digits = "".join(str(unicodedata.decimal(digit)) for digit in _DIGITS.findall(candidate))
-    if not (MIN_PHONE_DIGITS <= len(digits) <= MAX_PHONE_DIGITS):
-        return None
-    return f"+{digits}" if candidate.startswith("+") else digits
 
 
 def _resolve_service(text: str, services: tuple[str, ...]) -> str | None:
@@ -146,6 +123,8 @@ class ConversationEngine:
         business_name: str,
         language: Language = "en",
         max_message_length: int = 1000,
+        phone_default_region: str = "",
+        phone_allowed_regions: tuple[str, ...] = (),
     ) -> None:
         if not services:
             raise ValueError("at least one service type is required")
@@ -153,6 +132,13 @@ class ConversationEngine:
         self.business_name = business_name
         self.language = language
         self.max_message_length = max_message_length
+        self.phone_default_region = phone_default_region
+        self.phone_allowed_regions = frozenset(phone_allowed_regions)
+        # The country whose numbers are shown as examples: the default one, else the
+        # first allowed one, else whatever the phones module falls back to.
+        self._example_region = phone_default_region or next(
+            iter(sorted(self.phone_allowed_regions)), ""
+        )
 
     # -- helpers -----------------------------------------------------------------
 
@@ -165,13 +151,54 @@ class ConversationEngine:
     # -- entry point -------------------------------------------------------------
 
     def handle(
-        self, session: Session, *, customer: Customer, state: ConversationState, text: str
+        self,
+        session: Session,
+        *,
+        customer: Customer,
+        state: ConversationState,
+        text: str,
+        shared_contact: bool = False,
+        contact_is_own: bool = False,
     ) -> TurnResult:
         """Process one inbound message and return the replies to send.
 
         Never raises for bad customer input: every invalid value produces a re-prompt, because
         an exception here would mean a silent non-reply to a paying customer.
+
+        Args:
+            shared_contact: ``text`` is the phone number of a contact card the customer
+                shared, not something they typed.
+            contact_is_own: that contact card is the customer's own, as reported by the
+                messaging app. Only then is the number recorded as verified.
         """
+        step_before = state.step
+        result = self._dispatch(
+            session,
+            customer=customer,
+            state=state,
+            text=text,
+            shared_contact=shared_contact,
+            contact_is_own=shared_contact and contact_is_own,
+        )
+        if result.replies and not customer.is_blocked:
+            if state.step == Step.AWAITING_PHONE.value:
+                # Offered on every prompt of the phone step, re-prompts included: a customer
+                # whose typed number was refused is exactly who needs the one-tap way.
+                result.replies[-1].contact_button = self._render("share_phone_button")
+            elif step_before == Step.AWAITING_PHONE.value:
+                result.replies[0].remove_keyboard = True
+        return result
+
+    def _dispatch(
+        self,
+        session: Session,
+        *,
+        customer: Customer,
+        state: ConversationState,
+        text: str,
+        shared_contact: bool,
+        contact_is_own: bool,
+    ) -> TurnResult:
         result = TurnResult()
 
         if customer.is_blocked:
@@ -192,7 +219,14 @@ class ConversationEngine:
         if stripped.startswith("/"):
             return self._handle_command(session, customer=customer, state=state, text=stripped)
 
-        return self._handle_step(session, customer=customer, state=state, text=stripped)
+        return self._handle_step(
+            session,
+            customer=customer,
+            state=state,
+            text=stripped,
+            shared_contact=shared_contact,
+            contact_is_own=contact_is_own,
+        )
 
     # -- commands ----------------------------------------------------------------
 
@@ -260,8 +294,65 @@ class ConversationEngine:
 
     # -- steps -------------------------------------------------------------------
 
+    def _read_phone(self, text: str, *, shared_contact: bool, contact_is_own: bool) -> Phone:
+        """Validate what was sent at the phone step.
+
+        A typed number is read as typed. A shared contact card needs more care, because the
+        messaging app delivers the customer's *own* number in international form with no
+        leading ``+`` (``213555123456``): read the local way that would be refused, or worse,
+        matched to the wrong country. A card for somebody else carries the number however it
+        was saved in the address book, so it is read as typed first and as international
+        second.
+
+        Raises:
+            PhoneError: with the problem from the first reading, which is the one that
+                describes what the customer actually sent.
+        """
+        readings: tuple[bool, ...]
+        if contact_is_own:
+            readings = (True,)
+        elif shared_contact:
+            readings = (False, True)
+        else:
+            readings = (False,)
+
+        first_error: PhoneError | None = None
+        for international in readings:
+            try:
+                return parse_phone(
+                    text,
+                    default_region=self.phone_default_region,
+                    allowed_regions=self.phone_allowed_regions,
+                    international=international,
+                )
+            except PhoneError as exc:
+                first_error = first_error or exc
+        assert first_error is not None  # ``readings`` is never empty
+        raise first_error
+
+    def _phone_refusal(self, problem: PhoneProblem) -> str:
+        """The message for a refused number. Each one says what to send instead."""
+        local, international = example_numbers(self._example_region)
+        if problem is PhoneProblem.COUNTRY_CODE_REQUIRED:
+            return self._render("phone_needs_country_code", international=international)
+        if problem is PhoneProblem.REGION_NOT_ALLOWED:
+            return self._render(
+                "phone_region_not_allowed", regions=describe_regions(self.phone_allowed_regions)
+            )
+        if not self.phone_default_region:
+            # With no default country a local-style example would itself be refused.
+            return self._render("phone_needs_country_code", international=international)
+        return self._render("invalid_phone", local=local, international=international)
+
     def _handle_step(
-        self, session: Session, *, customer: Customer, state: ConversationState, text: str
+        self,
+        session: Session,
+        *,
+        customer: Customer,
+        state: ConversationState,
+        text: str,
+        shared_contact: bool = False,
+        contact_is_own: bool = False,
     ) -> TurnResult:
         result = TurnResult()
         step = state.step
@@ -290,11 +381,15 @@ class ConversationEngine:
             return result
 
         if step == Step.AWAITING_PHONE.value:
-            phone = normalise_phone(text)
-            if phone is None:
-                result.add(self._render("invalid_phone"))
+            try:
+                phone = self._read_phone(
+                    text, shared_contact=shared_contact, contact_is_own=contact_is_own
+                )
+            except PhoneError as exc:
+                result.add(self._phone_refusal(exc.problem))
                 return result
-            state.draft_phone = phone
+            state.draft_phone = phone.e164
+            state.draft_phone_verified = contact_is_own
             state.step = Step.AWAITING_ADDRESS.value
             result.add(self._render("ask_address"))
             return result
@@ -310,7 +405,8 @@ class ConversationEngine:
                     "confirm",
                     service=state.draft_service_type,
                     details=state.draft_details,
-                    phone=state.draft_phone,
+                    # Read back grouped, so a mistyped digit is easy to spot before saying yes.
+                    phone=format_international(state.draft_phone or ""),
                     address=state.draft_address,
                 )
             )
@@ -351,6 +447,7 @@ class ConversationEngine:
             service_type=str(state.draft_service_type),
             details=str(state.draft_details),
             contact_phone=str(state.draft_phone),
+            contact_phone_verified=bool(state.draft_phone_verified),
             address=str(state.draft_address),
         )
         # Keep the phone on the customer record so a returning customer is recognisable.
