@@ -15,6 +15,10 @@ bot token and no network.**
 [![Types](https://img.shields.io/badge/mypy-clean-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
+![Excerpt of the output of make demo](docs/demo.png)
+
+<sub>Real output of `make demo`, excerpted (`⋮` marks omitted lines). No bot token, no network.</sub>
+
 ---
 
 ## The problem this solves
