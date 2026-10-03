@@ -7,6 +7,8 @@ bot token and no network.**
 > Arabic *طَلَب* means "an order" or "a request". `talabflow` is the flow of a request from a
 > chat message to a closed record.
 
+**[اقرأ بالعربية](README.ar.md)**
+
 [![CI](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml/badge.svg)](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-324%20passing-brightgreen)](#testing)
