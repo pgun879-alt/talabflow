@@ -324,9 +324,9 @@ notification is delivered exactly once and each message is attempted exactly onc
 (`tests/test_outbox_claim.py`). Reverting the claim to a plain `SELECT` makes that test fail with
 duplicate deliveries, which is how the test was validated.
 
-**What is not tested:** PostgreSQL. The `EvalPlanQual` reasoning above is why the guard is written
-the way it is, but no PostgreSQL instance was run. Treat multi-worker operation on PostgreSQL as
-designed-for and unverified.
+**PostgreSQL:** the same test, with two real threads, also runs against PostgreSQL 16 in CI (the
+`postgres` job) and passes. What is still not tested is PostgreSQL under sustained production
+load, so treat multi-worker operation there as test-verified, not field-proven.
 
 `TALABFLOW_OUTBOX_LEASE_SECONDS` must exceed `TALABFLOW_HTTP_TIMEOUT_SECONDS`, or a slow send could
 outlive its own lease and be reclaimed mid-flight — the one way this design could duplicate a
@@ -338,13 +338,13 @@ message. Startup refuses that combination rather than leaving it as a footgun.
    Meta app review. `MessageTransport` is the seam a WhatsApp implementation would slot into;
    nothing above it would change. Not claimed as working, because it isn't written.
 2. **Single business per deployment.** No multi-tenancy. Two shops need two deployments.
-3. **SQLite is the only database that has been run.** Everything in this repository — the tests,
-   the demo, the CI job — runs on SQLite, and `PRAGMA busy_timeout` handles the bot and worker
-   writing concurrently. Because persistence goes through SQLAlchemy, pointing
-   `TALABFLOW_DATABASE_URL` at PostgreSQL should need no code change, **but that has never been
-   attempted**: no PostgreSQL instance was started at any point, so the URL, the migrations and
-   the outbox claim are all unverified on it. Treat PostgreSQL as an intended target, not a
-   supported one.
+3. **SQLite is the default; PostgreSQL is verified in CI only.** The demo and the Docker Compose
+   file run on SQLite, and `PRAGMA busy_timeout` handles the bot and worker writing concurrently.
+   A separate CI job runs the migrations (up, `alembic check`, down) and the test suite against
+   PostgreSQL 16 with no code change: install the driver with `pip install -e '.[postgres]'` and
+   point `TALABFLOW_DATABASE_URL` at `postgresql+psycopg://...`. **No PostgreSQL deployment has
+   been run** — the Compose service for it is still an unverified sketch — so this is "the tests
+   pass on it", not "it has been operated on it".
 4. **Rate limits and flood control are per-process.** They reset on restart and are not shared
    between workers. Honest for a single-server deployment; a horizontally scaled one needs Redis.
 5. **Language is per-deployment, not per-customer.** `TALABFLOW_DEFAULT_LANGUAGE` picks English
@@ -352,10 +352,9 @@ message. Startup refuses that combination rather than leaving it as a footgun.
 6. **No web dashboard.** The API is complete and documented; there is no UI on top of it. Staff
    use the CLI, the OpenAPI console, or a client someone builds.
 7. **No payments, no scheduling, no inventory.** Intake and tracking only.
-8. **Multi-worker delivery is verified on SQLite only.** Workers lease each message before sending,
-   and two concurrent workers on one SQLite file are tested not to double-send. The same guard is
-   written to be correct on PostgreSQL, but **no PostgreSQL instance was run**, so treat that as
-   designed-for and unverified. On PostgreSQL the claim does not use `SKIP LOCKED`, so under heavy
+8. **Multi-worker delivery is verified by tests, not in production.** Workers lease each message
+   before sending, and two concurrent workers are tested not to double-send on both SQLite and
+   PostgreSQL 16 (CI). On PostgreSQL the claim does not use `SKIP LOCKED`, so under heavy
    contention workers do redundant work — correct, but not optimal.
 9. **No message media.** Photos, voice notes and location pins are ignored; text only.
 
@@ -406,7 +405,7 @@ Every row was verified by running the code.
 | Immutable audit trail per change | ✅ Verified in the demo output |
 | Transactional outbox + worker with retry/backoff/dead-letter | ✅ 17 tests |
 | Notification deduplication per event | ✅ Verified live and in tests |
-| Outbox claim + lease, so two workers never send the same message | ✅ 22 tests, including two real threads against one SQLite file. **SQLite verified; PostgreSQL designed-for but not run.** |
+| Outbox claim + lease, so two workers never send the same message | ✅ 22 tests, including two real threads against one database. **Verified on SQLite and on PostgreSQL 16 in CI.** |
 | Crash recovery via lease expiry | ✅ Tested |
 | Token revocation: deactivation, deletion and demotion take effect on the next request | ✅ 4 tests |
 | Admin API: auth, RBAC, orders, status, stats, staff | ✅ 39 tests + live `curl` run |
@@ -428,10 +427,10 @@ transport, but no message has been sent through real Telegram from this code.
 
 1. Run against a real bot token and record the result (closes the one ⚠️).
 2. Per-customer language detection instead of a per-deployment default.
-3. Actually run PostgreSQL — migrations, the test suite, and the two-worker concurrency test —
-   so its row is no longer "designed-for but never run". Then add `FOR UPDATE SKIP LOCKED` to the
-   claim, which on PostgreSQL is a throughput optimisation rather than a correctness fix: the
-   repeated predicate already makes the claim safe.
+3. Verify the PostgreSQL Compose service end to end (the migrations and test suite already run
+   on PostgreSQL in CI), then add `FOR UPDATE SKIP LOCKED` to the claim, which on PostgreSQL is a
+   throughput optimisation rather than a correctness fix: the repeated predicate already makes
+   the claim safe.
 4. A minimal staff web dashboard over the existing API.
 5. WhatsApp Cloud API transport behind the existing interface.
 6. Scheduled appointments with reminder notifications.
