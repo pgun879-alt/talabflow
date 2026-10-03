@@ -28,7 +28,7 @@ def test_the_whole_order_flow_works_through_the_runner(
         assert page.total == 1
         order = page.items[0]
         assert order.service_type == "Repair"
-        assert order.contact_phone == "0555123456"
+        assert order.contact_phone == "+213555123456"
         assert order.reference in transport.last_text()
 
 
@@ -273,3 +273,63 @@ def test_status_change_notification_reaches_the_customer_end_to_end(
     transport.sent.clear()
     assert worker.process_batch() == (0, 0)
     assert transport.sent == [], "the customer must not be messaged twice for one change"
+
+
+# --------------------------------------------------------------------- phone number
+
+
+def test_the_share_button_reaches_the_transport_and_is_removed_afterwards(
+    bot: BotRunner, transport: ScriptedTransport
+) -> None:
+    transport.queue_many(["/new", "1", "The washing machine will not drain properly"])
+    bot.poll_once()
+    assert transport.sent[-1].contact_button == "Share my phone number"
+
+    transport.queue("0555123456")
+    bot.poll_once()
+    assert transport.sent[-1].contact_button is None
+    assert transport.sent[-1].remove_keyboard is True
+
+
+def test_a_shared_own_contact_becomes_a_verified_order_end_to_end(
+    bot: BotRunner, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    transport.queue_many(["/new", "1", "The washing machine will not drain properly"])
+    transport.queue("213555123456", contact_is_sender=True)
+    transport.queue_many(["12 Rue Didouche Mourad, Algiers", "yes"])
+    bot.poll_once()
+
+    with session_scope(session_factory) as session:
+        order = repository.list_orders(session).items[0]
+        assert order.contact_phone == "+213555123456"
+        assert order.contact_phone_verified is True
+
+
+def test_a_made_up_number_never_becomes_an_order(
+    bot: BotRunner, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    """The exact conversation that exposed the bug in a manual test."""
+    transport.queue_many(
+        [
+            "/new",
+            "1",
+            "The washing machine will not drain properly",
+            "98765432109876",
+            "12 Rue Didouche Mourad, Algiers",
+            "yes",
+        ]
+    )
+    bot.poll_once()
+    with session_scope(session_factory) as session:
+        assert repository.list_orders(session).total == 0
+
+
+def test_the_runner_uses_the_configured_phone_regions(
+    settings: Settings, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    strict = settings.model_copy(update={"phone_allowed_regions": ("DZ",)})
+    runner = BotRunner(settings=strict, transport=transport, session_factory=session_factory)
+    transport.queue_many(["/new", "1", "The washing machine will not drain properly"])
+    transport.queue("+212612345678")
+    runner.poll_once()
+    assert "DZ (+213)" in transport.last_text()

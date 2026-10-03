@@ -164,3 +164,47 @@ def test_status_is_exported_as_its_value_not_the_enum_repr(
     )
     rows = _csv_rows(orders_to_csv([order]))
     assert dict(zip(rows[0], rows[1], strict=True))["Status"] == "confirmed"
+
+
+# --------------------------------------------------------------------- phone numbers
+
+
+def test_a_stored_phone_number_is_exported_without_a_stray_apostrophe(
+    session: Session, customer: Customer
+) -> None:
+    """Every stored number starts with "+", which is also a formula trigger. A plus sign followed
+    only by digits cannot do anything, and staff copy these numbers straight out of the file."""
+    order = _order(session, customer, contact_phone="+213555123456")
+    rows = _csv_rows(orders_to_csv([order]))
+    assert dict(zip(rows[0], rows[1], strict=True))["Phone"] == "+213555123456"
+
+    sheet = load_workbook(io.BytesIO(orders_to_xlsx([order]))).active
+    headers = [cell.value for cell in sheet[1]]
+    assert sheet.cell(row=2, column=headers.index("Phone") + 1).value == "+213555123456"
+
+
+@pytest.mark.parametrize("payload", ["+213555+1", "+1+1", "+213555123456*2", "+SUM(A1)", "+"])
+def test_only_a_plain_number_is_exempt_from_the_formula_guard(
+    session: Session, customer: Customer, payload: str
+) -> None:
+    order = _order(session, customer, contact_phone=payload)
+    rows = _csv_rows(orders_to_csv([order]))
+    assert dict(zip(rows[0], rows[1], strict=True))["Phone"] == "'" + payload
+
+
+def test_the_export_says_whether_the_phone_number_was_verified(
+    session: Session, customer: Customer
+) -> None:
+    typed = _order(session, customer)
+    shared = repository.create_order(
+        session,
+        customer=customer,
+        service_type="Repair",
+        details="The washing machine will not drain",
+        contact_phone="+213555123456",
+        address="12 Rue Didouche Mourad, Algiers",
+        contact_phone_verified=True,
+    )
+    rows = _csv_rows(orders_to_csv([typed, shared]))
+    column = rows[0].index("Phone verified")
+    assert [row[column] for row in rows[1:]] == ["no", "yes"]

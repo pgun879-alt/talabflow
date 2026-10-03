@@ -183,6 +183,60 @@ def test_search_matches_reference_details_and_phone(session: Session, order: Ord
     assert repository.list_orders(session, search="definitely-absent").total == 0
 
 
+def _order_with_phone(session: Session, customer: Customer, phone: str) -> Order:
+    return repository.create_order(
+        session,
+        customer=customer,
+        service_type="Repair",
+        details="details here",
+        contact_phone=phone,
+        address="an address",
+    )
+
+
+@pytest.mark.parametrize(
+    "needle",
+    [
+        "0555123456",  # the way staff dial it
+        "0555 12 34 56",  # the way a customer reads it out
+        "0555-12-34-56",
+        "+213555123456",
+        "+213 555 12 34 56",  # copied from the confirmation message
+        "00213555123456",
+        "555123456",
+        "123456",  # the last digits, read from a missed-call list
+    ],
+)
+def test_search_finds_a_stored_number_however_it_is_typed(
+    session: Session, customer: Customer, needle: str
+) -> None:
+    """Numbers are stored as ``+213555123456``. Staff do not type them that way."""
+    _order_with_phone(session, customer, "+213555123456")
+    _order_with_phone(session, customer, "+213770999888")
+    assert repository.list_orders(session, search=needle).total == 1, needle
+
+
+def test_search_still_finds_numbers_stored_before_validation_existed(
+    session: Session, customer: Customer
+) -> None:
+    _order_with_phone(session, customer, "0555123456")
+    for needle in ["0555123456", "0555 12 34 56", "555123456"]:
+        assert repository.list_orders(session, search=needle).total == 1, needle
+
+
+def test_a_phone_search_does_not_match_unrelated_orders(
+    session: Session, customer: Customer
+) -> None:
+    _order_with_phone(session, customer, "+213555123456")
+    assert repository.list_orders(session, search="0770 99 98 88").total == 0
+    assert repository.list_orders(session, search="0555 12 34 57").total == 0
+
+
+def test_an_order_is_unverified_unless_stated_otherwise(order: Order, session: Session) -> None:
+    session.refresh(order)
+    assert order.contact_phone_verified is False
+
+
 def test_search_treats_sql_wildcards_as_literal_text(session: Session, order: Order) -> None:
     """A search for "%" must not match everything: the value stays a bound parameter."""
     assert repository.list_orders(session, search="%").total == 0

@@ -21,6 +21,7 @@ from talabflow.transports.telegram import (
     MAX_TELEGRAM_MESSAGE,
     TelegramTransport,
     _parse_message,
+    _reply_markup,
     _split_text,
 )
 
@@ -427,3 +428,128 @@ def test_sends_use_the_configured_timeout_not_the_long_poll_allowance() -> None:
     transport.send(OutboundMessage(chat_id="42", text="hello"))
 
     assert seen == {"getUpdates": 35.0, "sendMessage": 5.0}
+
+
+# --------------------------------------------------------------------- shared contacts
+
+
+def _contact(phone: str, *, contact_user: int | None, sender: int = 42) -> dict:
+    contact: dict = {"phone_number": phone, "first_name": "Amina"}
+    if contact_user is not None:
+        contact["user_id"] = contact_user
+    return {
+        "message_id": 8,
+        "contact": contact,
+        "chat": {"id": sender, "type": "private"},
+        "from": {"id": sender, "first_name": "Amina"},
+    }
+
+
+def test_the_senders_own_contact_card_is_read_as_their_number() -> None:
+    """What the "share my phone number" button produces: a card whose user id is the sender's."""
+    parsed = _parse_message(_contact("213555123456", contact_user=42))
+    assert parsed is not None
+    assert parsed.text == "213555123456"
+    assert parsed.is_contact is True
+    assert parsed.contact_is_sender is True
+
+
+def test_a_contact_card_for_somebody_else_is_not_the_senders_number() -> None:
+    parsed = _parse_message(_contact("213555123456", contact_user=777))
+    assert parsed is not None
+    assert parsed.is_contact is True
+    assert parsed.contact_is_sender is False
+
+
+def test_a_contact_card_with_no_user_id_is_not_the_senders_number() -> None:
+    """A card for someone who is not on Telegram carries no user id at all. A missing id on both
+    sides must never compare equal."""
+    parsed = _parse_message(_contact("0555123456", contact_user=None))
+    assert parsed is not None
+    assert parsed.contact_is_sender is False
+
+    no_sender_id = _contact("0555123456", contact_user=None)
+    no_sender_id["from"] = {"first_name": "Amina"}
+    parsed = _parse_message(no_sender_id)
+    assert parsed is not None
+    assert parsed.contact_is_sender is False
+
+
+@pytest.mark.parametrize("phone", [None, "", 213555123456])
+def test_a_contact_card_without_a_usable_number_is_skipped(phone: object) -> None:
+    raw = _contact("x", contact_user=42)
+    raw["contact"]["phone_number"] = phone
+    assert _parse_message(raw) is None
+
+
+def test_typed_text_is_never_treated_as_a_contact_card() -> None:
+    """A message that somehow carries both is a text message: the flag that marks a number as
+    verified must only ever come from a real card."""
+    raw = _contact("213555123456", contact_user=42)
+    raw["text"] = "0770123456"
+    parsed = _parse_message(raw)
+    assert parsed is not None
+    assert parsed.text == "0770123456"
+    assert parsed.is_contact is False
+    assert parsed.contact_is_sender is False
+
+
+def test_a_contact_card_in_a_group_is_ignored_like_any_other_group_message() -> None:
+    raw = _contact("213555123456", contact_user=42)
+    raw["chat"]["type"] = "group"
+    assert _parse_message(raw) is None
+
+
+def test_poll_delivers_a_shared_contact() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _ok([{"update_id": 5, "message": _contact("213555123456", contact_user=42)}])
+
+    transport = _transport(httpx.MockTransport(handler))
+    messages = transport.poll(timeout_seconds=0)
+    assert [message.contact_is_sender for message in messages] == [True]
+    transport.close()
+
+
+# --------------------------------------------------------------------- the share button
+
+
+def _sent_bodies(message: OutboundMessage) -> list[dict]:
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return _ok({"message_id": len(bodies)})
+
+    transport = _transport(httpx.MockTransport(handler))
+    transport.send(message)
+    transport.close()
+    return bodies
+
+
+def test_the_share_button_is_sent_as_a_request_contact_keyboard() -> None:
+    body = _sent_bodies(
+        OutboundMessage(chat_id="42", text="Phone?", contact_button="Share my phone number")
+    )[0]
+    assert body["reply_markup"] == {
+        "keyboard": [[{"text": "Share my phone number", "request_contact": True}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def test_the_keyboard_is_removed_on_request() -> None:
+    body = _sent_bodies(OutboundMessage(chat_id="42", text="Address?", remove_keyboard=True))[0]
+    assert body["reply_markup"] == {"remove_keyboard": True}
+
+
+def test_an_ordinary_message_carries_no_reply_markup() -> None:
+    assert "reply_markup" not in _sent_bodies(OutboundMessage(chat_id="42", text="hello"))[0]
+    assert _reply_markup(OutboundMessage(chat_id="42", text="hello")) is None
+
+
+def test_a_split_message_puts_the_button_under_the_last_part_only() -> None:
+    long_text = "a" * (MAX_TELEGRAM_MESSAGE + 10)
+    bodies = _sent_bodies(OutboundMessage(chat_id="42", text=long_text, contact_button="Share"))
+    assert len(bodies) == 2
+    assert "reply_markup" not in bodies[0]
+    assert bodies[1]["reply_markup"]["keyboard"][0][0]["request_contact"] is True

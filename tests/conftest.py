@@ -40,6 +40,8 @@ def settings(tmp_path: Path) -> Settings:
         service_types=("Repair", "Installation", "Consultation", "Maintenance"),
         outbox_backoff_base_seconds=1,
         outbox_max_attempts=3,
+        # The suite types numbers the way an Algerian customer would: "0555 12 34 56".
+        phone_default_region="DZ",
     )
 
 
@@ -77,6 +79,8 @@ def conversation_engine(settings: Settings) -> ConversationEngine:
         business_name=settings.business_name,
         language=settings.default_language,
         max_message_length=settings.max_message_length,
+        phone_default_region=settings.phone_default_region,
+        phone_allowed_regions=settings.phone_allowed_regions,
     )
 
 

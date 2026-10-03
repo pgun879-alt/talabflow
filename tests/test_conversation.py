@@ -14,7 +14,6 @@ from talabflow.conversation import (
     MIN_DETAILS_LENGTH,
     ConversationEngine,
     Step,
-    normalise_phone,
 )
 from talabflow.models import Customer, OrderStatus
 
@@ -39,44 +38,6 @@ def _say(engine: ConversationEngine, session: Session, customer: Customer, text:
     return engine.handle(session, customer=customer, state=state, text=text).texts
 
 
-# --------------------------------------------------------------------- phone parsing
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("0555123456", "0555123456"),
-        ("0555 12 34 56", "0555123456"),
-        ("+213 (555) 123-456", "+213555123456"),
-        ("0555-12-34-56", "0555123456"),
-        ("  0555123456  ", "0555123456"),
-        # Arabic-Indic and Persian digits are stored as ASCII, so staff can search for them.
-        ("٠٥٥٥١٢٣٤٥٦", "0555123456"),
-        ("+٢١٣ ٥٥٥ ١٢٣ ٤٥٦", "+213555123456"),
-        ("۰۵۵۵۱۲۳۴۵۶", "0555123456"),
-    ],
-)
-def test_normalise_phone_accepts_real_world_formatting(raw: str, expected: str) -> None:
-    """People write numbers many ways; rejecting formatting rejects paying customers."""
-    assert normalise_phone(raw) == expected
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "call me maybe",
-        "123",  # too few digits
-        "1234567890123456789",  # too many
-        "",
-        "   ",
-        "0555abc456",
-        "<script>alert(1)</script>",
-    ],
-)
-def test_normalise_phone_rejects_non_numbers(raw: str) -> None:
-    assert normalise_phone(raw) is None
-
-
 # --------------------------------------------------------------------- happy path
 
 
@@ -95,7 +56,9 @@ def test_full_happy_path_creates_an_order(
     assert result.created_order is not None
     order = result.created_order
     assert order.service_type == "Repair"
-    assert order.contact_phone == "0555123456"
+    # Stored in one canonical form, whatever way it was typed.
+    assert order.contact_phone == "+213555123456"
+    assert order.contact_phone_verified is False
     assert order.status is OrderStatus.NEW
     assert order.reference.startswith("TF-")
     assert order.reference in result.texts[0]
@@ -143,7 +106,7 @@ def test_the_phone_is_saved_onto_the_customer_record(
         "yes",
     ]:
         _say(conversation_engine, session, customer, text)
-    assert customer.phone == "0555123456"
+    assert customer.phone == "+213555123456"
 
 
 # --------------------------------------------------------------------- commands
@@ -451,12 +414,16 @@ def test_conversation_state_survives_a_new_engine_instance(
     settings, session: Session, customer: Customer
 ) -> None:
     """State is persisted, not in memory, so a restart does not lose a half-finished order."""
-    first = ConversationEngine(services=settings.service_types, business_name="X")
+    first = ConversationEngine(
+        services=settings.service_types, business_name="X", phone_default_region="DZ"
+    )
     _say(first, session, customer, "/new")
     _say(first, session, customer, "1")
     _say(first, session, customer, "The washing machine will not drain")
 
-    second = ConversationEngine(services=settings.service_types, business_name="X")
+    second = ConversationEngine(
+        services=settings.service_types, business_name="X", phone_default_region="DZ"
+    )
     replies = _say(second, session, customer, "0555123456")
     assert "address" in replies[0].lower()
 
@@ -464,3 +431,326 @@ def test_conversation_state_survives_a_new_engine_instance(
 def test_engine_requires_at_least_one_service() -> None:
     with pytest.raises(ValueError, match="at least one service"):
         ConversationEngine(services=(), business_name="X")
+
+
+# --------------------------------------------------------------------- phone validation
+
+
+def _to_phone_step(engine: ConversationEngine, session: Session, customer: Customer) -> None:
+    for text in ["/new", "1", "The washing machine will not drain"]:
+        _say(engine, session, customer, text)
+    assert _state(session, customer).step == Step.AWAITING_PHONE.value
+
+
+def _turn(engine: ConversationEngine, session: Session, customer: Customer, text: str, **flags):
+    state = _state(session, customer)
+    return engine.handle(session, customer=customer, state=state, text=text, **flags)
+
+
+@pytest.mark.parametrize("made_up", ["98765432109876", "+98765432109876", "0155123456", "12345"])
+def test_a_made_up_number_is_refused_at_the_phone_step(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer, made_up: str
+) -> None:
+    """Regression guard. ``98765432109876`` was accepted in a manual test: the old check only
+    counted digits, and fourteen is inside the 8-to-15 range."""
+    _to_phone_step(conversation_engine, session, customer)
+    replies = _say(conversation_engine, session, customer, made_up)
+    state = _state(session, customer)
+    assert state.step == Step.AWAITING_PHONE.value, "the bot moved on with a number nobody can call"
+    assert state.draft_phone is None
+    assert "address" not in replies[0].lower()
+
+
+def test_a_refused_number_is_answered_with_an_example_of_a_valid_one(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    """ "Invalid number" alone leaves the customer guessing what would be accepted."""
+    _to_phone_step(conversation_engine, session, customer)
+    reply = _say(conversation_engine, session, customer, "98765432109876")[0]
+    assert "0551 23 45 67" in reply
+    assert "+213 551 23 45 67" in reply
+
+
+def test_a_number_from_another_country_is_accepted_with_its_country_code(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    _to_phone_step(conversation_engine, session, customer)
+    replies = _say(conversation_engine, session, customer, "+212 612-345678")
+    assert "address" in replies[0].lower()
+    assert _state(session, customer).draft_phone == "+212612345678"
+
+
+def test_the_confirmation_reads_the_number_back_grouped(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    """A mistyped digit is far easier to spot in ``+213 555 12 34 56`` than in a run of ten."""
+    _to_phone_step(conversation_engine, session, customer)
+    _say(conversation_engine, session, customer, "0555123456")
+    replies = _say(conversation_engine, session, customer, "12 Rue Didouche Mourad, Algiers")
+    assert "+213 555 12 34 56" in replies[0]
+
+
+def test_without_a_default_region_the_bot_asks_for_the_country_code(
+    settings, session: Session, customer: Customer
+) -> None:
+    engine = ConversationEngine(services=settings.service_types, business_name="X")
+    _to_phone_step(engine, session, customer)
+    reply = _say(engine, session, customer, "0555123456")[0]
+    assert "country code" in reply
+    assert _state(session, customer).step == Step.AWAITING_PHONE.value
+
+    assert "address" in _say(engine, session, customer, "+213555123456")[0].lower()
+
+
+def test_without_a_default_region_no_local_style_example_is_offered(
+    settings, session: Session, customer: Customer
+) -> None:
+    """A local-style example would itself be refused when no country is configured."""
+    engine = ConversationEngine(services=settings.service_types, business_name="X")
+    _to_phone_step(engine, session, customer)
+    reply = _say(engine, session, customer, "not a number")[0]
+    assert "+213 551 23 45 67" in reply
+    assert "0551 23 45 67" not in reply
+
+
+def test_a_number_outside_the_allowed_countries_is_refused_and_the_countries_are_named(
+    settings, session: Session, customer: Customer
+) -> None:
+    engine = ConversationEngine(
+        services=settings.service_types,
+        business_name="X",
+        phone_default_region="DZ",
+        phone_allowed_regions=("DZ", "MA"),
+    )
+    _to_phone_step(engine, session, customer)
+    reply = _say(engine, session, customer, "+33 6 12 34 56 78")[0]
+    assert "DZ (+213), MA (+212)" in reply
+    assert _state(session, customer).step == Step.AWAITING_PHONE.value
+
+    assert "address" in _say(engine, session, customer, "+212 612-345678")[0].lower()
+
+
+def test_the_refusal_messages_exist_in_arabic(
+    settings, session: Session, customer: Customer
+) -> None:
+    engine = ConversationEngine(
+        services=settings.service_types,
+        business_name="X",
+        language="ar",
+        phone_default_region="DZ",
+        phone_allowed_regions=("DZ",),
+    )
+    _to_phone_step(engine, session, customer)
+    assert "0551 23 45 67" in _say(engine, session, customer, "98765432109876")[0]
+    assert "DZ (+213)" in _say(engine, session, customer, "+212612345678")[0]
+
+
+# --------------------------------------------------------------------- shared contact
+
+
+def test_sharing_your_own_contact_records_a_verified_number(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    """The messaging app sends the customer's own number in international form with no "+"."""
+    _to_phone_step(conversation_engine, session, customer)
+    result = _turn(
+        conversation_engine,
+        session,
+        customer,
+        "213555123456",
+        shared_contact=True,
+        contact_is_own=True,
+    )
+    assert "address" in result.texts[0].lower()
+    _say(conversation_engine, session, customer, "12 Rue Didouche Mourad, Algiers")
+    order = _turn(conversation_engine, session, customer, "yes").created_order
+    assert order is not None
+    assert order.contact_phone == "+213555123456"
+    assert order.contact_phone_verified is True
+
+
+def test_your_own_contact_from_another_country_is_not_misread_as_a_local_number(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    """``212612345678`` must be read as +212..., not as an Algerian number that happens to be
+    twelve digits long."""
+    _to_phone_step(conversation_engine, session, customer)
+    _turn(
+        conversation_engine,
+        session,
+        customer,
+        "212612345678",
+        shared_contact=True,
+        contact_is_own=True,
+    )
+    state = _state(session, customer)
+    assert state.draft_phone == "+212612345678"
+    assert state.draft_phone_verified is True
+
+
+def test_somebody_elses_contact_card_is_accepted_but_not_verified(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    """A customer may want to be called on a relative's number. That is fine -- it just is not
+    proof of anything, so it must not be marked verified."""
+    _to_phone_step(conversation_engine, session, customer)
+    _turn(conversation_engine, session, customer, "0555 12 34 56", shared_contact=True)
+    state = _state(session, customer)
+    assert state.draft_phone == "+213555123456"
+    assert state.draft_phone_verified is False
+
+
+def test_somebody_elses_card_saved_without_a_plus_sign_is_still_understood(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    _to_phone_step(conversation_engine, session, customer)
+    _turn(conversation_engine, session, customer, "212612345678", shared_contact=True)
+    state = _state(session, customer)
+    assert state.draft_phone == "+212612345678"
+    assert state.draft_phone_verified is False
+
+
+def test_a_typed_number_is_never_verified(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    """``contact_is_own`` without a shared contact card means nothing: verification comes from
+    the card, never from text."""
+    _to_phone_step(conversation_engine, session, customer)
+    _turn(conversation_engine, session, customer, "0555123456", contact_is_own=True)
+    assert _state(session, customer).draft_phone_verified is False
+
+
+def test_a_shared_contact_still_has_to_be_a_valid_number(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    _to_phone_step(conversation_engine, session, customer)
+    _turn(
+        conversation_engine,
+        session,
+        customer,
+        "98765432109876",
+        shared_contact=True,
+        contact_is_own=True,
+    )
+    state = _state(session, customer)
+    assert state.step == Step.AWAITING_PHONE.value
+    assert state.draft_phone is None
+    assert state.draft_phone_verified is False
+
+
+def test_a_shared_contact_must_respect_the_allowed_countries(
+    settings, session: Session, customer: Customer
+) -> None:
+    engine = ConversationEngine(
+        services=settings.service_types,
+        business_name="X",
+        phone_default_region="DZ",
+        phone_allowed_regions=("DZ",),
+    )
+    _to_phone_step(engine, session, customer)
+    result = _turn(
+        engine, session, customer, "33612345678", shared_contact=True, contact_is_own=True
+    )
+    assert "DZ (+213)" in result.texts[0]
+    assert _state(session, customer).step == Step.AWAITING_PHONE.value
+
+
+def test_the_verified_flag_does_not_leak_into_the_next_order(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    """Share a contact, abandon the order, start again and type a number: the second order's
+    number was typed, so it is not verified."""
+    _to_phone_step(conversation_engine, session, customer)
+    _turn(
+        conversation_engine,
+        session,
+        customer,
+        "213555123456",
+        shared_contact=True,
+        contact_is_own=True,
+    )
+    _say(conversation_engine, session, customer, "/cancel")
+
+    _to_phone_step(conversation_engine, session, customer)
+    _say(conversation_engine, session, customer, "0770 12 34 56")
+    _say(conversation_engine, session, customer, "12 Rue Didouche Mourad, Algiers")
+    order = _turn(conversation_engine, session, customer, "yes").created_order
+    assert order is not None
+    assert order.contact_phone == "+213770123456"
+    assert order.contact_phone_verified is False
+
+
+def test_a_contact_card_sent_outside_the_phone_step_changes_nothing(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    result = _turn(
+        conversation_engine,
+        session,
+        customer,
+        "213555123456",
+        shared_contact=True,
+        contact_is_own=True,
+    )
+    assert result.created_order is None
+    state = _state(session, customer)
+    assert state.step == Step.IDLE.value
+    assert state.draft_phone is None
+
+
+# --------------------------------------------------------------------- the share button
+
+
+def test_the_share_button_is_offered_when_the_phone_is_asked_for(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    _say(conversation_engine, session, customer, "/new")
+    _say(conversation_engine, session, customer, "1")
+    result = _turn(conversation_engine, session, customer, "The washing machine will not drain")
+    assert result.replies[-1].contact_button == "Share my phone number"
+    assert result.replies[-1].remove_keyboard is False
+
+
+def test_the_share_button_is_offered_again_after_a_refused_number(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    """Someone whose typed number was just refused is exactly who needs the one-tap way."""
+    _to_phone_step(conversation_engine, session, customer)
+    result = _turn(conversation_engine, session, customer, "98765432109876")
+    assert result.replies[-1].contact_button == "Share my phone number"
+
+
+def test_the_share_button_is_taken_away_once_the_phone_step_is_over(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    _to_phone_step(conversation_engine, session, customer)
+    result = _turn(conversation_engine, session, customer, "0555123456")
+    assert result.replies[0].remove_keyboard is True
+    assert result.replies[0].contact_button is None
+
+
+def test_cancelling_at_the_phone_step_also_takes_the_button_away(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    """Otherwise the button would sit under the chat for a customer who is no longer ordering."""
+    _to_phone_step(conversation_engine, session, customer)
+    result = _turn(conversation_engine, session, customer, "/cancel")
+    assert result.replies[0].remove_keyboard is True
+
+
+def test_no_other_step_shows_or_removes_a_keyboard(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    for text in ["/start", "/new", "1"]:
+        for reply in _turn(conversation_engine, session, customer, text).replies:
+            assert reply.contact_button is None
+            assert reply.remove_keyboard is False
+
+
+def test_the_share_button_label_follows_the_bot_language(
+    settings, session: Session, customer: Customer
+) -> None:
+    engine = ConversationEngine(services=settings.service_types, business_name="X", language="ar")
+    _say(engine, session, customer, "/new")
+    _say(engine, session, customer, "1")
+    result = _turn(engine, session, customer, "الغسالة لا تصرف الماء أبدا")
+    assert result.replies[-1].contact_button == "مشاركة رقم هاتفي"

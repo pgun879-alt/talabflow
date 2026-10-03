@@ -112,6 +112,51 @@ def test_list_settings_parse_from_real_environment_variables(
     assert settings.cors_allow_origins == ("http://localhost:3000", "https://x.example")
 
 
+# --------------------------------------------------------------------- phone regions
+
+
+def test_no_phone_region_is_configured_by_default() -> None:
+    settings = _base()
+    assert settings.phone_default_region == ""
+    assert settings.phone_allowed_regions == ()
+
+
+def test_phone_regions_are_normalised_to_upper_case() -> None:
+    settings = _base(phone_default_region=" dz ", phone_allowed_regions="dz, ma ,DZ")
+    assert settings.phone_default_region == "DZ"
+    assert settings.phone_allowed_regions == ("DZ", "MA")
+
+
+@pytest.mark.parametrize("value", ["Algeria", "213", "+213", "ZZ", "D"])
+def test_an_unknown_default_region_is_refused_at_startup(value: str) -> None:
+    """A typo here would otherwise surface as every customer's number being refused."""
+    with pytest.raises(ValidationError, match="PHONE_DEFAULT_REGION"):
+        _base(phone_default_region=value)
+
+
+def test_an_unknown_allowed_region_is_refused_and_named() -> None:
+    with pytest.raises(ValidationError, match="not recognised: XX"):
+        _base(phone_allowed_regions="DZ,XX")
+
+
+def test_a_default_region_outside_the_allowed_list_is_refused() -> None:
+    """Otherwise every number typed the local way would be read as a country that is not
+    accepted, and refused."""
+    with pytest.raises(ValidationError, match="is not in"):
+        _base(phone_default_region="DZ", phone_allowed_regions="MA,TN")
+
+
+def test_phone_regions_parse_from_real_environment_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TALABFLOW_JWT_SECRET", GOOD_SECRET)
+    monkeypatch.setenv("TALABFLOW_PHONE_DEFAULT_REGION", "dz")
+    monkeypatch.setenv("TALABFLOW_PHONE_ALLOWED_REGIONS", "DZ,MA,TN")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.phone_default_region == "DZ"
+    assert settings.phone_allowed_regions == ("DZ", "MA", "TN")
+
+
 # --------------------------------------------------------------------- ranges
 
 

@@ -261,6 +261,56 @@ def test_list_orders_filters_and_searches(
     assert found["total"] == 1
 
 
+def test_orders_report_whether_the_phone_number_was_verified(
+    client: TestClient,
+    staff_headers: dict[str, str],
+    order_reference: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    listed = client.get("/v1/orders", headers=staff_headers).json()["items"][0]
+    assert listed["contact_phone_verified"] is False
+    detail = client.get(f"/v1/orders/{order_reference}", headers=staff_headers).json()
+    assert detail["contact_phone_verified"] is False
+
+    with session_scope(session_factory) as session:
+        customer = repository.get_or_create_customer(
+            session, channel="scripted", channel_user_id="1001", chat_id="1001", display_name="A"
+        )
+        shared = repository.create_order(
+            session,
+            customer=customer,
+            service_type="Repair",
+            details="A second order, placed with a shared contact",
+            contact_phone="+213770123456",
+            address="an address",
+            contact_phone_verified=True,
+        ).reference
+    detail = client.get(f"/v1/orders/{shared}", headers=staff_headers).json()
+    assert detail["contact_phone_verified"] is True
+    assert detail["contact_phone"] == "+213770123456"
+
+
+def test_staff_can_search_by_a_phone_number_typed_the_local_way(
+    client: TestClient, staff_headers: dict[str, str], session_factory: sessionmaker[Session]
+) -> None:
+    with session_scope(session_factory) as session:
+        customer = repository.get_or_create_customer(
+            session, channel="scripted", channel_user_id="1001", chat_id="1001", display_name="A"
+        )
+        repository.create_order(
+            session,
+            customer=customer,
+            service_type="Repair",
+            details="The washing machine will not drain",
+            contact_phone="+213555123456",
+            address="an address",
+        )
+    found = client.get(
+        "/v1/orders", params={"search": "0555 12 34 56"}, headers=staff_headers
+    ).json()
+    assert found["total"] == 1
+
+
 def test_list_orders_validates_its_query_parameters(
     client: TestClient, staff_headers: dict[str, str]
 ) -> None:
