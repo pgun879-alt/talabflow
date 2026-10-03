@@ -49,8 +49,14 @@ class ScriptedTransport(MessageTransport):
         user_id: str = "1001",
         chat_id: str | None = None,
         display_name: str | None = "Demo Customer",
+        is_contact: bool = False,
+        contact_is_sender: bool = False,
     ) -> InboundMessage:
-        """Append one inbound message to the script."""
+        """Append one inbound message to the script.
+
+        ``is_contact`` makes it a shared contact card whose phone number is ``text``;
+        ``contact_is_sender`` additionally makes it the customer's own card.
+        """
         message = InboundMessage(
             channel=self.channel,
             chat_id=chat_id or user_id,
@@ -58,6 +64,8 @@ class ScriptedTransport(MessageTransport):
             text=text,
             message_id=str(next(self._ids)),
             display_name=display_name,
+            is_contact=is_contact or contact_is_sender,
+            contact_is_sender=contact_is_sender,
         )
         self._inbound.append(message)
         return message

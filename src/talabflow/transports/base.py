@@ -33,6 +33,11 @@ class InboundMessage:
     #: Opaque to the application. Set by a transport in manual-acknowledgement mode and handed
     #: back through :meth:`MessageTransport.acknowledge`.
     ack_token: str = ""
+    #: ``text`` is the phone number of a contact card the customer shared rather than typed.
+    is_contact: bool = False
+    #: The shared contact card is the sender's own, as reported by the provider. This is the
+    #: only case in which a phone number is known to belong to the account that sent it.
+    contact_is_sender: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +46,11 @@ class OutboundMessage:
 
     chat_id: str
     text: str
+    #: Show a button with this label that shares the customer's own phone number in one tap.
+    #: Advisory: a transport with no such control sends the text alone.
+    contact_button: str | None = None
+    #: Remove that button again.
+    remove_keyboard: bool = False
 
 
 class TransportError(RuntimeError):

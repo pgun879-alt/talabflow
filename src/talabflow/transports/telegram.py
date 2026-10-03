@@ -208,19 +208,22 @@ class TelegramTransport(MessageTransport):
 
     def send(self, message: OutboundMessage) -> str:
         last_id = ""
-        for part in _split_text(message.text):
-            result = self._call(
-                "sendMessage",
-                {
-                    "chat_id": message.chat_id,
-                    "text": part,
-                    # No parse_mode: customer-supplied text is echoed back in confirmations, and
-                    # Markdown/HTML parsing would let a stray character break delivery or let
-                    # crafted input inject formatting. Plain text is the safe default.
-                    "disable_web_page_preview": True,
-                },
-                timeout=self._send_timeout,
-            )
+        parts = _split_text(message.text)
+        markup = _reply_markup(message)
+        for index, part in enumerate(parts):
+            payload: dict[str, Any] = {
+                "chat_id": message.chat_id,
+                "text": part,
+                # No parse_mode: customer-supplied text is echoed back in confirmations, and
+                # Markdown/HTML parsing would let a stray character break delivery or let
+                # crafted input inject formatting. Plain text is the safe default.
+                "disable_web_page_preview": True,
+            }
+            # A keyboard belongs under the last part: that is the one the customer is looking
+            # at when they answer.
+            if markup is not None and index == len(parts) - 1:
+                payload["reply_markup"] = markup
+            result = self._call("sendMessage", payload, timeout=self._send_timeout)
             if isinstance(result, dict):
                 last_id = str(result.get("message_id", ""))
         return last_id
@@ -229,11 +232,34 @@ class TelegramTransport(MessageTransport):
         self._client.close()
 
 
+def _reply_markup(message: OutboundMessage) -> dict[str, Any] | None:
+    """The Bot API ``reply_markup`` for a message, or ``None`` for a plain one.
+
+    ``request_contact`` makes Telegram send the customer's *own* registered number when the
+    button is tapped. It only works in private chats, which is the only kind this transport
+    accepts.
+    """
+    if message.contact_button:
+        return {
+            "keyboard": [[{"text": message.contact_button, "request_contact": True}]],
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+        }
+    if message.remove_keyboard:
+        return {"remove_keyboard": True}
+    return None
+
+
 def _parse_message(raw: object) -> InboundMessage | None:
     """Convert a Telegram ``message`` object into an :class:`InboundMessage`.
 
     Returns ``None`` for anything without text -- a sticker, a photo, a join notification -- so
     unsupported update shapes are skipped rather than crashing the poll loop.
+
+    A shared contact card is the one non-text message that is understood: its phone number
+    becomes the text. It counts as the sender's own number only when Telegram reports the
+    card's ``user_id`` as the sender's id, which is what the "share my phone number" button
+    produces. A forwarded card for somebody else has a different id, or none.
 
     Also returns ``None`` for anything that is not a one-to-one chat. An order conversation echoes
     the customer's phone number and address back for confirmation, and later status notifications
@@ -247,7 +273,25 @@ def _parse_message(raw: object) -> InboundMessage | None:
     text = raw.get("text")
     chat = raw.get("chat")
     sender = raw.get("from")
-    if not isinstance(text, str) or not isinstance(chat, dict) or not isinstance(sender, dict):
+    if not isinstance(chat, dict) or not isinstance(sender, dict):
+        return None
+
+    is_contact = False
+    contact_is_sender = False
+    contact = raw.get("contact")
+    if not isinstance(text, str) and isinstance(contact, dict):
+        number = contact.get("phone_number")
+        if isinstance(number, str) and number:
+            text = number
+            is_contact = True
+            contact_user = contact.get("user_id")
+            sender_id = sender.get("id")
+            contact_is_sender = (
+                contact_user is not None
+                and sender_id is not None
+                and str(contact_user) == str(sender_id)
+            )
+    if not isinstance(text, str):
         return None
     if chat.get("type", "private") != "private":
         return None
@@ -266,6 +310,8 @@ def _parse_message(raw: object) -> InboundMessage | None:
         text=text,
         message_id=str(raw.get("message_id", "")),
         display_name=display or None,
+        is_contact=is_contact,
+        contact_is_sender=contact_is_sender,
     )
 
 
