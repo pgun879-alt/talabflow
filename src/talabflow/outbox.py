@@ -103,30 +103,7 @@ class OutboxWorker:
             )
             return False
         except TransportError as exc:
-            message.last_error = str(exc)[:500]
-            if message.attempts >= self.settings.outbox_max_attempts:
-                message.status = OutboxStatus.DEAD
-                repository.release_claim(message)
-                logger.error(
-                    "outbox message exhausted its attempts",
-                    extra={"outbox_id": message.id, "attempts": message.attempts},
-                )
-            else:
-                message.status = OutboxStatus.FAILED
-                message.next_attempt_at = utcnow() + backoff_delay(
-                    message.attempts, base_seconds=self.settings.outbox_backoff_base_seconds
-                )
-                # Release the lease so the retry is claimable by whichever worker gets there
-                # first, rather than reserved for this one.
-                repository.release_claim(message)
-                logger.info(
-                    "outbox delivery failed; will retry",
-                    extra={
-                        "outbox_id": message.id,
-                        "attempts": message.attempts,
-                        "next_attempt_at": message.next_attempt_at.isoformat(),
-                    },
-                )
+            self._record_failure(message, str(exc))
             return False
 
         message.status = OutboxStatus.SENT
@@ -138,6 +115,69 @@ class OutboxWorker:
             extra={"outbox_id": message.id, "provider_message_id": provider_id},
         )
         return True
+
+    def _record_failure(self, message: OutboxMessage, error: str) -> None:
+        """Apply the outcome of a failed attempt that has already been counted.
+
+        Backs off for a retry, or dead-letters once the attempt budget is spent.
+        """
+        message.last_error = error[:500]
+        if message.attempts >= self.settings.outbox_max_attempts:
+            message.status = OutboxStatus.DEAD
+            repository.release_claim(message)
+            logger.error(
+                "outbox message exhausted its attempts",
+                extra={"outbox_id": message.id, "attempts": message.attempts},
+            )
+            return
+        message.status = OutboxStatus.FAILED
+        message.next_attempt_at = utcnow() + backoff_delay(
+            message.attempts, base_seconds=self.settings.outbox_backoff_base_seconds
+        )
+        # Release the lease so the retry is claimable by whichever worker gets there first,
+        # rather than reserved for this one.
+        repository.release_claim(message)
+        logger.info(
+            "outbox delivery failed; will retry",
+            extra={
+                "outbox_id": message.id,
+                "attempts": message.attempts,
+                "next_attempt_at": message.next_attempt_at.isoformat(),
+            },
+        )
+
+    def _record_unexpected_failure(
+        self, session: Session, message: OutboxMessage, error: Exception
+    ) -> None:
+        """Count an attempt that ended in an exception the transport contract does not name.
+
+        The rollback that follows such an exception also discards the attempt counter that
+        ``_deliver`` had just incremented. Left like that, a message that reliably crashes the
+        send -- a bug in a transport, a payload the provider's client chokes on -- would never use
+        up its budget: its lease would expire, it would be claimed again, and it would fail again,
+        for ever, without being dead-lettered.
+
+        So the attempt is re-applied here in its own transaction, and treated exactly like a
+        transient failure. If even that cannot be written, the lease is left to expire, which is
+        the old behaviour and the safe fallback.
+        """
+        try:
+            session.refresh(message)
+            if (
+                message.status is not OutboxStatus.PROCESSING
+                or message.claimed_by != self.worker_id
+            ):
+                return
+            message.attempts += 1
+            self._record_failure(message, f"unexpected {type(error).__name__}: {error}")
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception(
+                "could not record a failed attempt; the lease will expire and the message will "
+                "be retried",
+                extra={"outbox_id": message.id, "worker": self.worker_id},
+            )
 
     # -- batches -----------------------------------------------------------------
 
@@ -186,13 +226,13 @@ class OutboxWorker:
                     else:
                         failed += 1
                     session.commit()
-                except Exception:
+                except Exception as exc:
                     session.rollback()
                     logger.exception(
-                        "unexpected error delivering an outbox message; its lease will expire "
-                        "and it will be retried",
+                        "unexpected error delivering an outbox message",
                         extra={"outbox_id": message.id, "worker": self.worker_id},
                     )
+                    self._record_unexpected_failure(session, message, exc)
                     failed += 1
         finally:
             session.close()
