@@ -204,6 +204,13 @@ def _parse_message(raw: object) -> InboundMessage | None:
 
     Returns ``None`` for anything without text -- a sticker, a photo, a join notification -- so
     unsupported update shapes are skipped rather than crashing the poll loop.
+
+    Also returns ``None`` for anything that is not a one-to-one chat. An order conversation echoes
+    the customer's phone number and address back for confirmation, and later status notifications
+    go to the last chat the customer wrote from. In a group that means reading a customer's
+    address out to the whole group, and then sending their order updates there too. Telegram
+    always includes ``chat.type``; only an explicit non-private type is refused, so a payload
+    without the field is still treated as a direct message.
     """
     if not isinstance(raw, dict):
         return None
@@ -211,6 +218,8 @@ def _parse_message(raw: object) -> InboundMessage | None:
     chat = raw.get("chat")
     sender = raw.get("from")
     if not isinstance(text, str) or not isinstance(chat, dict) or not isinstance(sender, dict):
+        return None
+    if chat.get("type", "private") != "private":
         return None
 
     first = str(sender.get("first_name", "") or "")
