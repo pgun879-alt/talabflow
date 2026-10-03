@@ -67,6 +67,10 @@ class TelegramTransport(MessageTransport):
             timeout=httpx.Timeout(timeout_seconds + 30.0),
             follow_redirects=False,
         )
+        # Sends are not long polls, so they get the configured timeout without the long-poll
+        # allowance. The outbox lease is validated against this value: a send that could run for
+        # 30 seconds longer than the configuration says could outlive its own lease.
+        self._send_timeout = timeout_seconds
         # getUpdates only acknowledges updates once a higher offset is requested, so the offset
         # is persisted: without it a restart replays the last batch and the customer is asked
         # the same question twice.
@@ -96,15 +100,22 @@ class TelegramTransport(MessageTransport):
 
     # -- HTTP --------------------------------------------------------------------
 
-    def _call(self, method: str, payload: dict[str, Any]) -> Any:
+    def _call(self, method: str, payload: dict[str, Any], *, timeout: float | None = None) -> Any:
         """Call a Bot API method and return its ``result``.
+
+        ``timeout`` overrides the client default for this one call. ``None`` means "use the
+        client default" -- it is deliberately not passed through to httpx, where ``None`` would
+        mean "no timeout at all".
 
         Raises:
             PermanentTransportError: for errors that retrying cannot fix.
             TransportError: for transient failures.
         """
         try:
-            response = self._client.post(f"/{method}", json=payload)
+            if timeout is None:
+                response = self._client.post(f"/{method}", json=payload)
+            else:
+                response = self._client.post(f"/{method}", json=payload, timeout=timeout)
         except httpx.TimeoutException as exc:
             raise TransportError(f"{method} timed out") from exc
         except httpx.HTTPError as exc:
@@ -178,6 +189,7 @@ class TelegramTransport(MessageTransport):
                     # crafted input inject formatting. Plain text is the safe default.
                     "disable_web_page_preview": True,
                 },
+                timeout=self._send_timeout,
             )
             if isinstance(result, dict):
                 last_id = str(result.get("message_id", ""))
