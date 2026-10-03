@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from . import repository
-from .config import Settings, get_settings
+from .config import MIN_SECRET_LENGTH, PLACEHOLDER_SECRET, Settings, get_settings
 from .db import build_engine, build_session_factory, create_all
 from .exports import orders_to_csv, orders_to_xlsx
 from .logging_setup import configure_logging, safe_extra
@@ -273,9 +273,31 @@ AdminClaims = Annotated[TokenClaims, Depends(require_admin)]
 # --------------------------------------------------------------------------- app
 
 
+def _require_signing_secret(settings: Settings) -> None:
+    """Refuse to serve the API with a guessable token-signing secret, in *any* environment.
+
+    ``Settings`` only enforces this when ``environment`` is ``production`` -- but ``development``
+    is the default, so a deployment that never set it would run with the placeholder printed in
+    ``.env.example``. Anyone who knows that string and one admin username can sign their own admin
+    token; no password is involved at all.
+
+    The check lives here rather than in ``Settings`` because only the API signs and verifies
+    tokens. The bot, the worker and the offline demo never touch the secret and must keep working
+    without one.
+    """
+    secret = settings.jwt_secret
+    if secret == PLACEHOLDER_SECRET or len(secret) < MIN_SECRET_LENGTH:
+        raise RuntimeError(
+            "TALABFLOW_JWT_SECRET is the placeholder or is shorter than "
+            f"{MIN_SECRET_LENGTH} characters, so the admin API will not start. Generate one: "
+            "python3 -c 'import secrets; print(secrets.token_urlsafe(48))'"
+        )
+
+
 def create_app(settings: Settings | None = None, *, create_schema: bool = False) -> FastAPI:
     """Build the ASGI application."""
     resolved = settings or get_settings()
+    _require_signing_secret(resolved)
     configure_logging(resolved.log_level)
     engine = build_engine(resolved)
     if create_schema:
