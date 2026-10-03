@@ -19,7 +19,7 @@ import threading
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import Engine, create_engine, event, func, select
+from sqlalchemy import Engine, create_engine, event, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from talabflow import repository
@@ -287,6 +287,86 @@ def test_a_dead_lettered_message_releases_the_lease(
 
 
 # ------------------------------------------------------------------ real concurrency
+
+
+def test_a_worker_skips_messages_whose_lease_it_lost_mid_batch(
+    session_factory: sessionmaker[Session], settings: Settings
+) -> None:
+    """Regression guard: a lease taken once per batch does not cover a slow batch.
+
+    The claim leases a whole batch at one moment, but the batch is then sent one message at a
+    time. If the early sends are slow, the leases on the later messages run out while they are
+    still waiting their turn, another worker legitimately reclaims and sends them -- and the
+    first worker used to send them again when it finally got there.
+
+    Reproduced here without sleeping: while worker A's first send is in flight, the leases on the
+    rest of its batch are expired and worker B drains them. A must then notice it no longer holds
+    those rows and leave them alone.
+    """
+    _queue_notifications(session_factory, 3)
+    in_flight_id = _all_messages(session_factory)[0].id
+    delivered: list[str] = []
+
+    class Recording(ScriptedTransport):
+        def send(self, message: OutboundMessage) -> str:
+            delivered.append(message.text)
+            return super().send(message)
+
+    worker_b = OutboxWorker(
+        settings=settings.model_copy(update={"worker_id": WORKER_B}),
+        transport=Recording(),
+        session_factory=session_factory,
+    )
+
+    class SlowFirstSend(Recording):
+        interrupted = False
+
+        def send(self, message: OutboundMessage) -> str:
+            if not self.interrupted:
+                self.interrupted = True
+                with session_scope(session_factory) as other:
+                    other.execute(
+                        update(OutboxMessage)
+                        .where(
+                            OutboxMessage.status == OutboxStatus.PROCESSING,
+                            OutboxMessage.id != in_flight_id,
+                        )
+                        .values(lease_expires_at=utcnow() - timedelta(seconds=1))
+                    )
+                assert worker_b.process_batch() == (2, 0)
+            return super().send(message)
+
+    worker_a = OutboxWorker(
+        settings=settings.model_copy(update={"worker_id": WORKER_A}),
+        transport=SlowFirstSend(),
+        session_factory=session_factory,
+    )
+    assert worker_a.process_batch() == (1, 0)
+
+    assert len(delivered) == 3, f"expected 3 sends, saw {len(delivered)}"
+    assert len(set(delivered)) == 3, "a notification was delivered twice"
+    rows = _all_messages(session_factory)
+    assert [row.status for row in rows] == [OutboxStatus.SENT] * 3
+    assert [row.attempts for row in rows] == [1, 1, 1]
+
+
+def test_renewing_a_claim_extends_the_lease_only_for_its_holder(
+    session_factory: sessionmaker[Session],
+) -> None:
+    _queue_notifications(session_factory, 1)
+    with session_scope(session_factory) as session:
+        (message,) = repository.claim_outbox_batch(
+            session, worker_id=WORKER_A, limit=1, lease_seconds=10
+        )
+        original_expiry = message.lease_expires_at
+        assert original_expiry is not None
+
+        assert not repository.renew_claim(session, message, worker_id=WORKER_B, lease_seconds=60)
+        assert repository.renew_claim(session, message, worker_id=WORKER_A, lease_seconds=60)
+        assert message.lease_expires_at is not None
+        assert message.lease_expires_at > original_expiry
+
+    assert _all_messages(session_factory)[0].lease_expires_at > original_expiry
 
 
 def test_two_concurrent_workers_never_send_the_same_message_twice(

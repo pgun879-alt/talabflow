@@ -323,3 +323,27 @@ def test_split_text_leaves_a_short_message_alone() -> None:
 def test_split_text_falls_back_to_a_hard_cut_without_newlines() -> None:
     parts = _split_text("x" * 9000, limit=4096)
     assert [len(part) for part in parts] == [4096, 4096, 808]
+
+
+def test_sends_use_the_configured_timeout_not_the_long_poll_allowance() -> None:
+    """The outbox lease is validated against the HTTP timeout, so a send must really honour it.
+
+    The client default carries an extra allowance so a long poll does not time out client-side.
+    A send that inherited that allowance could run longer than the configuration claims -- and
+    longer than the lease that is supposed to cover it.
+    """
+    seen: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        method = request.url.path.rsplit("/", 1)[-1]
+        seen[method] = request.extensions["timeout"]["read"]
+        return _ok([] if method == "getUpdates" else {"message_id": 1})
+
+    transport = TelegramTransport(bot_token="12345:TESTTOKEN", timeout_seconds=5.0)
+    transport._client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url=BASE, timeout=35.0
+    )
+    transport.poll(timeout_seconds=0)
+    transport.send(OutboundMessage(chat_id="42", text="hello"))
+
+    assert seen == {"getUpdates": 35.0, "sendMessage": 5.0}

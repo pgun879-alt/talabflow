@@ -427,6 +427,68 @@ def test_the_api_rate_limit_returns_429(settings: Settings, engine, staff_users)
         assert int(limited.headers["Retry-After"]) >= 1
 
 
+def test_repeated_login_attempts_are_throttled(settings: Settings, engine, staff_users) -> None:
+    """Regression guard: the login endpoint used to accept unlimited password guesses.
+
+    The general rate limit only applies *after* a token has been verified, so it never protected
+    the one endpoint that takes a password.
+    """
+    limited = settings.model_copy(update={"login_attempts_per_minute": 3})
+    with TestClient(create_app(limited)) as client:
+        codes = [
+            client.post(
+                "/v1/auth/token", json={"username": ADMIN_USERNAME, "password": f"wrong-guess-{n}"}
+            ).status_code
+            for n in range(5)
+        ]
+        assert codes == [401, 401, 401, 429, 429]
+
+        # Once throttled, even the right password is refused -- otherwise the limit would only
+        # slow an attacker down until the guess that mattered.
+        blocked = client.post(
+            "/v1/auth/token", json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD}
+        )
+        assert blocked.status_code == 429
+        assert int(blocked.headers["Retry-After"]) >= 1
+
+        # The limit is per account: another member of staff can still sign in.
+        other = client.post(
+            "/v1/auth/token", json={"username": STAFF_USERNAME, "password": STAFF_PASSWORD}
+        )
+        assert other.status_code == 200
+
+
+def test_the_login_throttle_ignores_username_case_and_padding(
+    settings: Settings, engine, staff_users
+) -> None:
+    """``Admin-User`` and `` admin-user `` are the same account, so they share one budget."""
+    limited = settings.model_copy(update={"login_attempts_per_minute": 2})
+    with TestClient(create_app(limited)) as client:
+        variants = [ADMIN_USERNAME, ADMIN_USERNAME.upper(), f" {ADMIN_USERNAME} "]
+        codes = [
+            client.post(
+                "/v1/auth/token", json={"username": name, "password": "wrong-guess-x"}
+            ).status_code
+            for name in variants
+        ]
+        assert codes == [401, 401, 429]
+
+
+@pytest.mark.parametrize("secret", ["change-me", "short-secret"])
+def test_the_api_refuses_to_start_with_a_guessable_signing_secret(
+    settings: Settings, engine, secret: str
+) -> None:
+    """Regression guard: the placeholder secret used to be accepted outside production.
+
+    ``environment`` defaults to ``development``, so a deployment that never set it ran with the
+    signing secret printed in ``.env.example`` -- and anyone who knew an admin's username could
+    mint themselves a valid admin token without a password.
+    """
+    weak = settings.model_copy(update={"jwt_secret": secret, "environment": "development"})
+    with pytest.raises(RuntimeError, match="TALABFLOW_JWT_SECRET"):
+        create_app(weak)
+
+
 def test_openapi_schema_is_generated(client: TestClient) -> None:
     paths = client.get("/openapi.json").json()["paths"]
     for expected in ["/v1/auth/token", "/v1/orders", "/v1/stats", "/v1/staff"]:

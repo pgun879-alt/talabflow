@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, sessionmaker
 
 from talabflow import repository
+from talabflow.db import session_scope
 from talabflow.models import (
     ALLOWED_TRANSITIONS,
     Customer,
@@ -216,6 +218,71 @@ def test_terminal_statuses_allow_nothing_further(session: Session, order: Order)
         repository.change_order_status(
             session, order=order, to_status=OrderStatus.CONFIRMED, actor="amina"
         )
+
+
+def test_a_stale_status_change_cannot_overwrite_a_newer_one(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Regression guard for a lost update between two members of staff.
+
+    Both requests load the order while it is ``ready``. The first cancels it and commits. The
+    second, still holding its stale copy, asks for ``completed`` -- a transition that is valid
+    from ``ready`` but not from ``cancelled``. The check used to run against the stale copy only,
+    so the second write went through: a cancelled order came back to life as completed, the audit
+    trail showed two changes out of ``ready``, and the customer was told both.
+    """
+    with session_scope(session_factory) as setup:
+        owner = repository.get_or_create_customer(
+            setup, channel="scripted", channel_user_id="1001", chat_id="1001", display_name="Amina"
+        )
+        created = repository.create_order(
+            setup,
+            customer=owner,
+            service_type="Repair",
+            details="The washing machine will not drain",
+            contact_phone="0555123456",
+            address="12 Rue Didouche Mourad, Algiers",
+        )
+        for step in (OrderStatus.CONFIRMED, OrderStatus.IN_PROGRESS, OrderStatus.READY):
+            repository.change_order_status(setup, order=created, to_status=step, actor="amina")
+        reference = created.reference
+
+    first = session_factory()
+    second = session_factory()
+    try:
+        seen_by_first = repository.get_order_by_reference(first, reference)
+        seen_by_second = repository.get_order_by_reference(second, reference)
+        assert seen_by_first is not None
+        assert seen_by_second is not None
+
+        repository.change_order_status(
+            first, order=seen_by_first, to_status=OrderStatus.CANCELLED, actor="amina"
+        )
+        first.commit()
+
+        with pytest.raises(InvalidTransitionError, match="changed by someone else"):
+            repository.change_order_status(
+                second, order=seen_by_second, to_status=OrderStatus.COMPLETED, actor="karim"
+            )
+        second.rollback()
+    finally:
+        first.close()
+        second.close()
+
+    with session_scope(session_factory) as check:
+        final = repository.get_order_by_reference(check, reference)
+        assert final is not None
+        assert final.status is OrderStatus.CANCELLED
+        trail = [event.to_status for event in repository.load_order_events(check, final.id)]
+        assert trail == [
+            OrderStatus.NEW,
+            OrderStatus.CONFIRMED,
+            OrderStatus.IN_PROGRESS,
+            OrderStatus.READY,
+            OrderStatus.CANCELLED,
+        ]
+        # One notification per real change, and none for the change that was refused.
+        assert check.scalar(select(func.count()).select_from(OutboxMessage)) == 4
 
 
 def test_every_change_appends_to_the_audit_trail(session: Session, order: Order) -> None:

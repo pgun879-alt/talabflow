@@ -111,6 +111,30 @@ def test_configure_logging_installs_exactly_one_handler_and_is_idempotent() -> N
     configure_logging("INFO", json_output=False)
 
 
+def test_the_bot_token_never_reaches_the_log(capsys: pytest.CaptureFixture[str]) -> None:
+    """Regression guard for a credential leak.
+
+    ``httpx`` logs every request line at INFO, URL included, and the Telegram Bot API carries the
+    bot token *in the URL path*. With the root logger at INFO -- the default -- the token was
+    written to the log on every poll and every send, so anyone who could read the logs could take
+    over the bot.
+    """
+    import httpx
+
+    configure_logging("DEBUG")
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"ok": True, "result": []})
+        ),
+        base_url="https://api.telegram.org/bot12345:SECRETTOKEN",
+    )
+    client.post("/getUpdates", json={})
+    client.close()
+
+    assert "SECRETTOKEN" not in capsys.readouterr().err
+    configure_logging("INFO", json_output=False)
+
+
 def test_exceptions_are_rendered_into_the_payload() -> None:
     try:
         raise ValueError("boom")
