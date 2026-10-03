@@ -21,6 +21,8 @@ export TALABFLOW_TRANSPORT=scripted
 export TALABFLOW_JWT_SECRET="demo-only-secret-not-for-production-use-x"
 export TALABFLOW_ENVIRONMENT=development
 export TALABFLOW_LOG_LEVEL=WARNING
+# The demo customers are in Algeria and type their numbers the local way.
+export TALABFLOW_PHONE_DEFAULT_REGION=DZ
 
 rule() { printf '\n\033[1;36m%s\033[0m\n' "── $* ─────────────────────────────────────────"; }
 

@@ -47,6 +47,7 @@ CONVERSATIONS = [
             "ac",  # too short
             "Need a split air conditioner installed in the living room",
             "not telling you",  # not a phone number
+            "98765432109876",  # digits, but no country has such a number
             "+213 555 98 76 54",  # accepted, formatting and all
             "Cite 200 Logements, Bloc B, Oran",
             "wait",  # not a confirmation
