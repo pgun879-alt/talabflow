@@ -2,12 +2,12 @@
 #
 #   docker compose up --build
 #
-# All three share one SQLite file on a named volume. That is the only configuration that has
-# actually been run: the tests, the demo and CI are all SQLite.
+# All three share one SQLite file on a named volume. That is the only Compose configuration that
+# has actually been run.
 #
-# A PostgreSQL service is sketched at the bottom of this file, commented out. It is a starting
-# point, not a supported path -- no PostgreSQL instance was ever started during development, so
-# nothing about it has been verified.
+# A PostgreSQL service is sketched at the bottom of this file, commented out. The migrations and
+# the test suite pass on PostgreSQL in CI, but this Compose service itself has never been started,
+# so treat it as a starting point, not a supported path.
 
 name: talabflow
 
@@ -63,7 +63,7 @@ volumes:
 
 # UNVERIFIED. To try PostgreSQL, uncomment this service, add
 #   TALABFLOW_DATABASE_URL: postgresql+psycopg://talabflow:${POSTGRES_PASSWORD}@db:5432/talabflow
-# to x-common's environment, add `psycopg[binary]` to the dependencies, and add a
+# to x-common's environment, install the `postgres` extra in the image, and add a
 # `db: {condition: service_healthy}` entry to each depends_on block.
 #
 #  db:
