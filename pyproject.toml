@@ -27,6 +27,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.2,<9.0", "ruff>=0.5,<1.0", "mypy>=1.10,<3.0"]
+# The PostgreSQL driver. Optional: SQLite needs nothing beyond the standard library.
+postgres = ["psycopg[binary]>=3.1,<4.0"]
 
 [project.scripts]
 talabflow = "talabflow.cli:app"
