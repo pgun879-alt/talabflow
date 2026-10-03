@@ -14,6 +14,9 @@ What the design does guarantee:
   never produce two rows.
 * A worker **claims** a row -- committing ``status = processing`` with a lease -- *before* making
   any outbound call. Two workers therefore never hold the same row at the same time.
+* A batch is claimed at once but sent one message at a time, so the worker **renews the lease
+  immediately before each send** and skips any row it no longer holds. A lease therefore only has
+  to outlast one send, not the whole batch.
 * A row is marked ``sent`` immediately after the transport confirms.
 
 The window that remains, stated plainly: if a worker crashes **after** the provider accepted the
@@ -146,6 +149,10 @@ class OutboxWorker:
         crash halfway through would roll back the ``sent`` marks of messages that had already been
         delivered, and they would all go out again.
 
+        The lease is renewed right before each send. Without that, a slow batch outlives the lease
+        taken at claim time: another worker reclaims the messages still waiting their turn, sends
+        them, and this worker would then send them a second time.
+
         Returns:
             ``(sent, failed)`` counts for this batch.
         """
@@ -161,6 +168,19 @@ class OutboxWorker:
             )
             for message in claimed:
                 try:
+                    if not repository.renew_claim(
+                        session,
+                        message,
+                        worker_id=self.worker_id,
+                        lease_seconds=self.settings.outbox_lease_seconds,
+                    ):
+                        # Not a failure: another worker took the row over after its lease ran
+                        # out, and is (or was) responsible for delivering it.
+                        logger.warning(
+                            "lease lost before sending; leaving the message to its new owner",
+                            extra={"outbox_id": message.id, "worker": self.worker_id},
+                        )
+                        continue
                     if self._deliver(session, message):
                         sent += 1
                     else:

@@ -509,6 +509,50 @@ def claim_outbox_batch(
     return claimed
 
 
+def renew_claim(
+    session: Session,
+    message: OutboxMessage,
+    *,
+    worker_id: str,
+    lease_seconds: int,
+    now: datetime | None = None,
+) -> bool:
+    """Extend ``worker_id``'s lease on ``message`` and commit it, or report the lease as lost.
+
+    A batch is claimed at one moment but sent one message at a time, so by the time the worker
+    reaches the later messages their leases may have run out and another worker may already have
+    reclaimed -- or sent -- them. The worker therefore calls this immediately before each send.
+
+    The update is conditional on the row still being ``processing`` under *this* claim
+    (``claimed_by`` and ``claimed_at`` both unchanged), so it doubles as the ownership check:
+
+    * ``True`` -- the row is still ours and now carries a fresh, full-length lease, committed
+      before the outbound call exactly as the original claim was.
+    * ``False`` -- someone else holds or has finished the row. The caller must not send it and
+      must not write to it.
+    """
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+    moment = now or utcnow()
+    expires_at = moment + timedelta(seconds=lease_seconds)
+    result = session.execute(
+        update(OutboxMessage)
+        .where(
+            OutboxMessage.id == message.id,
+            OutboxMessage.status == OutboxStatus.PROCESSING,
+            OutboxMessage.claimed_by == worker_id,
+            OutboxMessage.claimed_at == message.claimed_at,
+        )
+        .values(lease_expires_at=expires_at)
+        .execution_options(synchronize_session=False)
+    )
+    session.commit()
+    if int(cast("CursorResult[Any]", result).rowcount or 0) != 1:
+        return False
+    set_committed_value(message, "lease_expires_at", expires_at)
+    return True
+
+
 def release_claim(message: OutboxMessage) -> None:
     """Clear the lease fields once a row has reached a terminal or waiting state.
 
