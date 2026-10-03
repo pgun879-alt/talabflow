@@ -11,7 +11,7 @@ bot token and no network.**
 
 [![CI](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml/badge.svg)](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-333%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-362%20passing-brightgreen)](#testing)
 [![Types](https://img.shields.io/badge/mypy-clean-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -42,7 +42,7 @@ puts a real system behind it.
 
 | | Typical tutorial bot | `talabflow` |
 |---|---|---|
-| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 333 tests, zero network calls |
+| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 362 tests, zero network calls |
 | Conversation state | A dict in memory, lost on restart | Persisted per customer; a half-finished order survives a restart |
 | Unscripted input | Breaks on anything unexpected | Explicit state machine; every invalid value re-prompts |
 | Status changes | `UPDATE orders SET status=...` | Guarded transitions + an immutable audit event per change |
@@ -151,6 +151,7 @@ polling outbound only.
 ```bash
 ./.venv/bin/alembic upgrade head                      # apply migrations
 ./.venv/bin/python -m talabflow.cli create-staff amina --admin   # prompts for the password
+./.venv/bin/python -m talabflow.cli update-staff karim --deactivate   # or --role admin, --reset-password
 ./.venv/bin/python -m talabflow.cli list-orders --status new
 ./.venv/bin/python -m talabflow.cli set-status TF-20260928-K7M2 confirmed --note "Tech assigned"
 ./.venv/bin/python -m talabflow.cli export orders.xlsx
@@ -178,6 +179,7 @@ The API will not start without a real signing secret, even in development.
 | `GET` | `/v1/orders-export?format=xlsx\|csv` | staff | Download a spreadsheet |
 | `GET` | `/v1/stats` | staff | Counts per status |
 | `GET` `POST` | `/v1/staff` | **admin** | List / create staff accounts |
+| `PATCH` | `/v1/staff/{username}` | **admin** | Deactivate or reactivate an account, change its role, or set a new password. The last active admin cannot be deactivated or demoted |
 | `GET` | `/healthz` · `/readyz` | — | Liveness · readiness (checks the database) |
 
 ```bash
@@ -249,7 +251,7 @@ make test
 Verified on Python 3.13.9, Linux, by running these commands after the most recent change:
 
 ```
-333 passed                                       # pytest
+362 passed                                       # pytest
 Success: no issues found in 19 source files      # mypy
 All checks passed!                               # ruff check
 41 files already formatted                       # ruff format --check
@@ -264,9 +266,9 @@ The suite runs **fully offline**. The Telegram transport is exercised through an
 `httpx` mock transport, so request shape, offset persistence, update parsing and error
 classification are genuinely tested — without a token or a network call.
 
-Coverage is concentrated where the risk is: 47 tests on the conversation state machine, 33 on the
+Coverage is concentrated where the risk is: 55 tests on the conversation state machine, 41 on the
 repository and outbox write path, 24 on outbox claiming and the duplicate-enqueue savepoint
-(`tests/test_outbox_claim.py`), 26 on the Telegram transport, 48 on the API, 31 on security
+(`tests/test_outbox_claim.py`), 31 on the Telegram transport, 53 on the API, 31 on security
 primitives.
 
 ## Security
@@ -281,7 +283,8 @@ primitives.
 | Authorisation | Role checks are FastAPI dependencies, so forgetting one makes a route *unreachable* rather than public. |
 | Order privacy | The customer-facing `/status` lookup is scoped to the requesting customer. Without that, anyone who guessed or overheard a reference could read another customer's phone number and address. Tested. |
 | Reference guessing | References use `secrets`, not `random`. A predictable reference would let someone enumerate orders. |
-| SQL injection | SQLAlchemy ORM throughout; search uses a bound `LIKE` parameter, with a test asserting that `'; DROP TABLE orders; --` matches nothing and the table survives. |
+| SQL injection | SQLAlchemy ORM throughout; search uses a bound `LIKE` parameter, with a test asserting that `'; DROP TABLE orders; --` matches nothing and the table survives. `LIKE`'s own wildcards are escaped too, so a search for `%` does not match every order. |
+| Group chats | Messages from groups, supergroups and channels are ignored. The intake conversation echoes a phone number and address back for confirmation, and status notifications go to the chat the customer last wrote from — in a group that would publish both. |
 | Spreadsheet formula injection | A customer can type `=HYPERLINK("http://evil","click")` into a chat field. Excel and LibreOffice evaluate that when staff open the export — free-text field to code execution on the buyer's machine. Leading formula triggers are prefixed with an apostrophe. Tested for both CSV and XLSX. |
 | Markup injection | Telegram messages are sent with **no `parse_mode`**, because confirmations echo customer text back. |
 | Flood control | Per-customer sliding window on inbound messages; per-user on the API, returning 429 with `Retry-After`. |
@@ -312,6 +315,16 @@ What the design does guarantee:
   outlast one send, not a whole slow batch;
 - rows are marked `sent` immediately after the transport confirms, committed **per message** rather
   than per batch.
+
+- an attempt that ends in an **unexpected exception** — a bug in a transport, not a delivery
+  error — is counted like any other failed attempt, so a message that reliably crashes the send
+  is dead-lettered once its budget is spent instead of being retried for ever.
+
+**Inbound messages** are acknowledged to Telegram only *after* they have been handled, so a
+crash partway through a batch does not lose the messages still waiting. That too is
+at-least-once: a crash between committing a message's work and acknowledging it means the
+message is handled twice. A message whose handling *fails* is not replayed — that would let one
+bad message block every other customer — and the customer is asked to send it again.
 
 **The window that remains:** if a worker crashes *after* the provider accepted a message but
 *before* the `sent` commit, the lease eventually expires and the message is delivered a second
@@ -373,6 +386,11 @@ message. Startup refuses that combination rather than leaving it as a footgun.
    PostgreSQL 16 (CI). On PostgreSQL the claim does not use `SKIP LOCKED`, so under heavy
    contention workers do redundant work — correct, but not optimal.
 9. **No message media.** Photos, voice notes and location pins are ignored; text only.
+10. **Private chats only.** The bot ignores messages sent in groups and channels, on purpose:
+    see the Security table.
+11. **A password reset does not cancel tokens already issued.** They expire on their own, within
+    the token lifetime (60 minutes by default). Deactivating the account cuts access on the next
+    request.
 
 ## Troubleshooting
 
@@ -416,16 +434,17 @@ Every row was verified by running the code.
 
 | Feature | Status |
 |---|---|
-| Intake conversation state machine, persisted per customer | ✅ 47 tests |
+| Intake conversation state machine, persisted per customer | ✅ 55 tests |
 | Order references (unambiguous alphabet, confusable correction) | ✅ 26 tests |
 | Status pipeline with guarded transitions | ✅ Tested, including every refusal |
 | Immutable audit trail per change | ✅ Verified in the demo output |
-| Transactional outbox + worker with retry/backoff/dead-letter | ✅ 17 tests |
+| Transactional outbox + worker with retry/backoff/dead-letter | ✅ 18 tests |
 | Notification deduplication per event | ✅ Verified live and in tests |
 | Outbox claim + lease, so two workers never send the same message | ✅ 24 tests, including two real threads against one database and a worker losing its lease mid-batch. **Verified on SQLite and on PostgreSQL 16 in CI.** |
 | Crash recovery via lease expiry | ✅ Tested |
-| Token revocation: deactivation, deletion and demotion take effect on the next request | ✅ 4 tests |
-| Admin API: auth, RBAC, orders, status, stats, staff, login throttling | ✅ 44 tests + live `curl` run |
+| Token revocation: deactivation, deletion and demotion take effect on the next request | ✅ 4 tests. Triggered through `PATCH /v1/staff/{username}` or `talabflow update-staff` |
+| Admin API: auth, RBAC, orders, status, stats, staff management, login throttling | ✅ 49 tests + live `curl` run |
+| Inbound messages acknowledged after handling; a crash mid-batch redelivers them | ✅ Tested offline and against a mock Bot API. Not exercised against real Telegram |
 | Concurrent status changes to one order: compare-and-swap, the stale request gets 409 | ✅ Tested with two sessions |
 | XLSX / CSV export with formula-injection guard | ✅ 16 tests |
 | Alembic migrations | ✅ `upgrade`, `downgrade`, re-`upgrade` and `alembic check` all verified, and run in CI |
@@ -474,7 +493,7 @@ src/talabflow/
 └── transports/        base (interface) · scripted (offline) · telegram (real)
 migrations/            Alembic; never imports application code
 scripts/               demo.sh, demo_conversation.py, demo_pipeline.py
-tests/                 333 tests, fully offline
+tests/                 362 tests, fully offline
 ```
 
 ## Sample data
