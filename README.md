@@ -11,7 +11,7 @@ bot token and no network.**
 
 [![CI](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml/badge.svg)](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-324%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-333%20passing-brightgreen)](#testing)
 [![Types](https://img.shields.io/badge/mypy-clean-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -42,7 +42,7 @@ puts a real system behind it.
 
 | | Typical tutorial bot | `talabflow` |
 |---|---|---|
-| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 324 tests, zero network calls |
+| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 333 tests, zero network calls |
 | Conversation state | A dict in memory, lost on restart | Persisted per customer; a half-finished order survives a restart |
 | Unscripted input | Breaks on anything unexpected | Explicit state machine; every invalid value re-prompts |
 | Status changes | `UPDATE orders SET status=...` | Guarded transitions + an immutable audit event per change |
@@ -161,8 +161,11 @@ polling outbound only.
 ### Admin API
 
 ```bash
+export TALABFLOW_JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
 ./.venv/bin/python -m talabflow.cli serve
 ```
+
+The API will not start without a real signing secret, even in development.
 
 `http://127.0.0.1:8000/docs` is the generated OpenAPI console.
 
@@ -230,9 +233,11 @@ Configuration is validated at startup and **refuses to run in an unsafe state**:
 | `ENVIRONMENT=production` with the `.env.example` placeholder secret | Startup fails — shipping the example verbatim is the likeliest deployment mistake |
 | `ENVIRONMENT=production` with a secret under 32 characters | Startup fails |
 | `ENVIRONMENT=production` with `CORS_ALLOW_ORIGINS=*` | Startup fails |
+| The admin API started with the placeholder secret, or one under 32 characters, in **any** environment | The API refuses to start. The bot, the worker and the demo never use the secret and are unaffected |
 | Empty or duplicated `SERVICE_TYPES` | Startup fails — duplicates would make two menu numbers mean the same thing |
 
-Development stays permissive, so none of this makes local work painful.
+Development stays permissive otherwise, so none of this makes local work painful: the offline
+demo, the bot and the worker need no secret at all.
 
 ## Testing
 
@@ -244,7 +249,7 @@ make test
 Verified on Python 3.13.9, Linux, by running these commands after the most recent change:
 
 ```
-324 passed                                       # pytest
+333 passed                                       # pytest
 Success: no issues found in 19 source files      # mypy
 All checks passed!                               # ruff check
 41 files already formatted                       # ruff format --check
@@ -259,9 +264,9 @@ The suite runs **fully offline**. The Telegram transport is exercised through an
 `httpx` mock transport, so request shape, offset persistence, update parsing and error
 classification are genuinely tested — without a token or a network call.
 
-Coverage is concentrated where the risk is: 47 tests on the conversation state machine, 32 on the
-repository and outbox write path, 22 on outbox claiming and the duplicate-enqueue savepoint
-(`tests/test_outbox_claim.py`), 25 on the Telegram transport, 43 on the API, 31 on security
+Coverage is concentrated where the risk is: 47 tests on the conversation state machine, 33 on the
+repository and outbox write path, 24 on outbox claiming and the duplicate-enqueue savepoint
+(`tests/test_outbox_claim.py`), 26 on the Telegram transport, 48 on the API, 31 on security
 primitives.
 
 ## Security
@@ -271,6 +276,8 @@ primitives.
 | Passwords | `hashlib.scrypt` (RFC 7914, memory-hard) with a per-password random salt and the cost parameters stored inside the hash, so they can be raised later without invalidating existing passwords. Compared with `hmac.compare_digest`. |
 | Tokens | Short-lived HS256 JWTs. The allowed algorithm is passed explicitly as a single-item list — accepting the token's own `alg` header is the classic JWT forgery (`alg: none`, or HS256 verified against an RSA public key). `exp`, `iat` and `sub` are required. |
 | Login enumeration | "No such user", "wrong password" and "deactivated" return one identical message, and a missing user still runs a hash comparison so it does not return measurably faster. |
+| Login brute force | `POST /v1/auth/token` is throttled per account (`LOGIN_ATTEMPTS_PER_MINUTE`, default 10) and per client address, **before** any password hashing, and returns 429 with `Retry-After`. The general API limit is keyed on a verified token, so it cannot protect the endpoint that issues tokens. Trade-off: someone who knows a username can keep that account from signing in while they keep sending requests; tokens already issued keep working. |
+| Signing secret | The admin API refuses to start with the `.env.example` placeholder or a secret under 32 characters, **in any environment**. `development` is the default environment, so checking only in production would let a forgotten setting run with a published secret — enough to forge an admin token without a password. |
 | Authorisation | Role checks are FastAPI dependencies, so forgetting one makes a route *unreachable* rather than public. |
 | Order privacy | The customer-facing `/status` lookup is scoped to the requesting customer. Without that, anyone who guessed or overheard a reference could read another customer's phone number and address. Tested. |
 | Reference guessing | References use `secrets`, not `random`. A predictable reference would let someone enumerate orders. |
@@ -279,7 +286,7 @@ primitives.
 | Markup injection | Telegram messages are sent with **no `parse_mode`**, because confirmations echo customer text back. |
 | Flood control | Per-customer sliding window on inbound messages; per-user on the API, returning 429 with `Retry-After`. |
 | Secrets | Never committed. `.env`, `data/`, `*.sqlite3` are git-ignored; `.env.example` holds placeholders. Secret fields use `repr=False`. The Alembic config reads the database URL from the environment so a connection string with a password is never in a committed file. |
-| Log hygiene | Structured JSON logs carry references, ids, counts and timings — **never** a phone number, an address, or a message body. |
+| Log hygiene | Structured JSON logs carry references, ids, counts and timings — **never** a phone number, an address, or a message body. `httpx` request lines are suppressed: it logs every URL at INFO, and the Telegram Bot API puts the bot token in the URL path. |
 | Shell execution | None. No customer or staff input ever reaches a shell. |
 | Container | Non-root user (uid 10001), two-stage build, `.dockerignore` excludes `.env` and `data/`. |
 | Default bind | `127.0.0.1` outside Docker. |
@@ -300,6 +307,9 @@ What the design does guarantee:
   id and an expiry — **before** making any outbound call, so two workers never hold the same row;
 - if the worker holding a row dies, its lease expires and the row becomes claimable again, so a
   crash does not strand a message;
+- a batch is claimed at once but sent one message at a time, so the worker **renews its lease
+  immediately before each send** and skips any row it no longer holds — a lease only has to
+  outlast one send, not a whole slow batch;
 - rows are marked `sent` immediately after the transport confirms, committed **per message** rather
   than per batch.
 
@@ -369,8 +379,9 @@ message. Startup refuses that combination rather than leaving it as a footgun.
 **`TALABFLOW_TRANSPORT=telegram requires TALABFLOW_TELEGRAM_BOT_TOKEN`** — working as intended.
 Either set the token or use `scripted`.
 
-**`TALABFLOW_JWT_SECRET is still the placeholder`** — you set `ENVIRONMENT=production` without
-generating a secret. Run:
+**`TALABFLOW_JWT_SECRET is still the placeholder`**, or **`TALABFLOW_JWT_SECRET is the placeholder
+or is shorter than 32 characters, so the admin API will not start`** — the admin API needs a real
+signing secret in every environment. Run:
 
 ```bash
 python3 -c "import secrets; print(secrets.token_urlsafe(48))"
@@ -411,10 +422,11 @@ Every row was verified by running the code.
 | Immutable audit trail per change | ✅ Verified in the demo output |
 | Transactional outbox + worker with retry/backoff/dead-letter | ✅ 17 tests |
 | Notification deduplication per event | ✅ Verified live and in tests |
-| Outbox claim + lease, so two workers never send the same message | ✅ 22 tests, including two real threads against one database. **Verified on SQLite and on PostgreSQL 16 in CI.** |
+| Outbox claim + lease, so two workers never send the same message | ✅ 24 tests, including two real threads against one database and a worker losing its lease mid-batch. **Verified on SQLite and on PostgreSQL 16 in CI.** |
 | Crash recovery via lease expiry | ✅ Tested |
 | Token revocation: deactivation, deletion and demotion take effect on the next request | ✅ 4 tests |
-| Admin API: auth, RBAC, orders, status, stats, staff | ✅ 39 tests + live `curl` run |
+| Admin API: auth, RBAC, orders, status, stats, staff, login throttling | ✅ 44 tests + live `curl` run |
+| Concurrent status changes to one order: compare-and-swap, the stale request gets 409 | ✅ Tested with two sessions |
 | XLSX / CSV export with formula-injection guard | ✅ 16 tests |
 | Alembic migrations | ✅ `upgrade`, `downgrade`, re-`upgrade` and `alembic check` all verified, and run in CI |
 | CI (format, lint, types, tests, migrations, hygiene) | ✅ Workflow committed and valid. Its real status is the CI badge at the top of this file, which reports whatever GitHub last ran — including "no runs yet" |
@@ -462,7 +474,7 @@ src/talabflow/
 └── transports/        base (interface) · scripted (offline) · telegram (real)
 migrations/            Alembic; never imports application code
 scripts/               demo.sh, demo_conversation.py, demo_pipeline.py
-tests/                 324 tests, fully offline
+tests/                 333 tests, fully offline
 ```
 
 ## Sample data
