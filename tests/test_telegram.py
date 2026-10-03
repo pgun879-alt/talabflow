@@ -128,6 +128,64 @@ def test_the_offset_is_persisted_across_instances(tmp_path: Path) -> None:
     second.close()
 
 
+def test_with_manual_acknowledgement_the_offset_only_moves_once_a_message_is_handled(
+    tmp_path: Path,
+) -> None:
+    """Regression guard: the offset used to be saved as soon as a batch was received.
+
+    Telegram discards an update once a higher offset is requested, so saving the offset before
+    the messages were handled meant a crash in between lost them. With manual acknowledgement the
+    offset advances message by message, and unsupported updates are skipped along the way.
+    """
+    offset_file = tmp_path / "offset.txt"
+    updates = [
+        {"update_id": 10, "message": {"message_id": 1, "sticker": {}}},  # unsupported, leading
+        {"update_id": 11, "message": _message("first")},
+        {"update_id": 12, "message": {"message_id": 2, "sticker": {}}},  # unsupported, between
+        {"update_id": 13, "message": _message("second")},
+        {"update_id": 14, "message": {"message_id": 3, "sticker": {}}},  # unsupported, trailing
+    ]
+    transport = _transport(httpx.MockTransport(lambda r: _ok(updates)), offset_path=offset_file)
+    transport.manual_ack = True
+
+    first, second = transport.poll(timeout_seconds=0)
+    assert (first.text, second.text) == ("first", "second")
+    # Leading updates nobody will ever handle are skipped at once; the first message is not.
+    assert offset_file.read_text().strip() == "11"
+
+    transport.acknowledge(first)
+    assert offset_file.read_text().strip() == "13", "skips the unsupported update in between"
+
+    transport.acknowledge(second)
+    assert offset_file.read_text().strip() == "15", "covers the trailing unsupported update"
+
+    transport.acknowledge(first)
+    assert offset_file.read_text().strip() == "15", "a late acknowledgement never moves it back"
+    transport.close()
+
+
+def test_an_unacknowledged_message_is_requested_again_after_a_restart(tmp_path: Path) -> None:
+    offset_file = tmp_path / "offset.txt"
+    first = _transport(
+        httpx.MockTransport(lambda r: _ok([{"update_id": 500, "message": _message()}])),
+        offset_path=offset_file,
+    )
+    first.manual_ack = True
+    assert len(first.poll(timeout_seconds=0)) == 1
+    first.close()  # the process dies before the message is handled
+
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["offset"])
+        return _ok([])
+
+    second = _transport(httpx.MockTransport(handler), offset_path=offset_file)
+    second.poll(timeout_seconds=0)
+    assert seen == [500], "the unhandled update must be asked for again"
+    second.close()
+
+
 def test_a_corrupt_offset_file_falls_back_to_zero(tmp_path: Path) -> None:
     offset_file = tmp_path / "offset.txt"
     offset_file.write_text("not-a-number")
@@ -306,6 +364,28 @@ def test_parse_message_tolerates_a_missing_name_entirely() -> None:
     parsed = _parse_message({"message_id": 1, "text": "hi", "chat": {"id": 5}, "from": {"id": 6}})
     assert parsed is not None
     assert parsed.display_name is None
+
+
+@pytest.mark.parametrize("chat_type", ["group", "supergroup", "channel"])
+def test_messages_from_group_chats_are_ignored(chat_type: str) -> None:
+    """Regression guard for a privacy leak.
+
+    The intake conversation echoes the customer's phone number and address back, and status
+    notifications go to the last chat the customer wrote from. A command typed in a group used to
+    start that conversation in front of everyone, and redirected the customer's later order
+    updates to the group.
+    """
+    raw = {
+        "message_id": 9,
+        "text": "/new@NourBot",
+        "chat": {"id": -1001234567890, "type": chat_type},
+        "from": {"id": 555, "first_name": "Karim"},
+    }
+    assert _parse_message(raw) is None
+
+    transport = _transport(httpx.MockTransport(lambda r: _ok([{"update_id": 7, "message": raw}])))
+    assert transport.poll(timeout_seconds=0) == []
+    assert transport._offset == 8, "the ignored update must still be acknowledged"
 
 
 def test_split_text_prefers_line_boundaries() -> None:

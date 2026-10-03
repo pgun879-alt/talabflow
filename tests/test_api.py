@@ -519,6 +519,79 @@ def test_a_deactivated_account_loses_access_immediately(
     assert "no longer active" in response.json()["detail"]
 
 
+def test_an_admin_can_deactivate_a_colleague_and_their_token_stops_working(
+    client: TestClient, admin_headers: dict[str, str], staff_headers: dict[str, str]
+) -> None:
+    """The revocation the API promises has to be reachable through the API.
+
+    Access was already re-checked on every request, but the only way to *trigger* a deactivation
+    was to edit the database by hand.
+    """
+    assert client.get("/v1/orders", headers=staff_headers).status_code == 200
+
+    response = client.patch(
+        f"/v1/staff/{STAFF_USERNAME}", json={"is_active": False}, headers=admin_headers
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["is_active"] is False
+
+    assert client.get("/v1/orders", headers=staff_headers).status_code == 401
+    login = client.post(
+        "/v1/auth/token", json={"username": STAFF_USERNAME, "password": STAFF_PASSWORD}
+    )
+    assert login.status_code == 401
+
+
+def test_an_admin_can_change_a_role_and_reset_a_password(
+    client: TestClient, admin_headers: dict[str, str]
+) -> None:
+    response = client.patch(
+        f"/v1/staff/{STAFF_USERNAME}",
+        json={"role": "admin", "password": "a-brand-new-password"},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["role"] == "admin"
+    assert "password" not in response.text
+
+    old = client.post(
+        "/v1/auth/token", json={"username": STAFF_USERNAME, "password": STAFF_PASSWORD}
+    )
+    new = client.post(
+        "/v1/auth/token", json={"username": STAFF_USERNAME, "password": "a-brand-new-password"}
+    )
+    assert (old.status_code, new.status_code) == (401, 200)
+    assert new.json()["role"] == "admin"
+
+
+def test_staff_cannot_update_accounts(client: TestClient, staff_headers: dict[str, str]) -> None:
+    response = client.patch(
+        f"/v1/staff/{ADMIN_USERNAME}", json={"is_active": False}, headers=staff_headers
+    )
+    assert response.status_code == 403
+
+
+def test_the_only_admin_cannot_lock_everyone_out(
+    client: TestClient, admin_headers: dict[str, str]
+) -> None:
+    for change in ({"is_active": False}, {"role": "staff"}):
+        response = client.patch(f"/v1/staff/{ADMIN_USERNAME}", json=change, headers=admin_headers)
+        assert response.status_code == 409
+        assert "only active admin" in response.json()["detail"]
+    assert client.get("/v1/staff", headers=admin_headers).status_code == 200
+
+
+def test_updating_staff_validates_its_input(
+    client: TestClient, admin_headers: dict[str, str]
+) -> None:
+    unknown = client.patch("/v1/staff/nobody", json={"is_active": False}, headers=admin_headers)
+    empty = client.patch(f"/v1/staff/{STAFF_USERNAME}", json={}, headers=admin_headers)
+    weak = client.patch(
+        f"/v1/staff/{STAFF_USERNAME}", json={"password": "short"}, headers=admin_headers
+    )
+    assert (unknown.status_code, empty.status_code, weak.status_code) == (404, 422, 422)
+
+
 def test_a_deleted_account_loses_access_immediately(
     client: TestClient, staff_headers: dict[str, str], session_factory: sessionmaker[Session]
 ) -> None:

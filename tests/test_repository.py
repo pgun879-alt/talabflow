@@ -16,8 +16,13 @@ from talabflow.models import (
     OutboxMessage,
     StaffRole,
 )
-from talabflow.repository import DuplicateUserError, InvalidTransitionError
-from talabflow.security import PasswordPolicyError
+from talabflow.repository import (
+    DuplicateUserError,
+    InvalidTransitionError,
+    LastAdminError,
+    StaffNotFoundError,
+)
+from talabflow.security import PasswordPolicyError, verify_password
 
 
 @pytest.fixture
@@ -73,6 +78,27 @@ def test_a_changed_display_name_and_chat_id_are_picked_up(session: Session) -> N
     assert updated.id == created.id
     assert updated.display_name == "New Name"
     assert updated.chat_id == "99"
+
+
+def test_an_over_long_display_name_is_truncated_not_rejected(session: Session) -> None:
+    """Regression guard: one long name made the bot go silent for that customer on PostgreSQL.
+
+    Telegram allows 64 characters each for a first and a last name. Joined with a space that is
+    129 -- one more than the column holds. SQLite ignores the declared length; PostgreSQL enforces
+    it, so the insert failed, the message was dropped, and the customer never got a reply.
+    """
+    long_name = "A" * 64 + " " + "B" * 64
+    created = repository.get_or_create_customer(
+        session, channel="telegram", channel_user_id="42", chat_id="42", display_name=long_name
+    )
+    session.flush()
+    assert created.display_name == long_name[:128]
+
+    renamed = repository.get_or_create_customer(
+        session, channel="telegram", channel_user_id="42", chat_id="42", display_name="C" * 200
+    )
+    session.flush()
+    assert renamed.display_name == "C" * 128
 
 
 # --------------------------------------------------------------------- orders
@@ -159,6 +185,10 @@ def test_search_matches_reference_details_and_phone(session: Session, order: Ord
 
 def test_search_treats_sql_wildcards_as_literal_text(session: Session, order: Order) -> None:
     """A search for "%" must not match everything: the value stays a bound parameter."""
+    assert repository.list_orders(session, search="%").total == 0
+    assert repository.list_orders(session, search="_").total == 0
+    assert repository.list_orders(session, search="wash_ng").total == 0
+    assert repository.list_orders(session, search="washing").total == 1
     assert repository.list_orders(session, search="'; DROP TABLE orders; --").total == 0
     # And the table is still there afterwards.
     assert repository.list_orders(session).total == 1
@@ -428,6 +458,67 @@ def test_a_short_password_is_refused(session: Session) -> None:
 def test_an_empty_username_is_refused(session: Session) -> None:
     with pytest.raises(ValueError, match="username must not be empty"):
         repository.create_staff_user(session, username="   ", password="a-good-password")
+
+
+def _two_admins_and_a_staff_member(session: Session) -> None:
+    repository.create_staff_user(
+        session, username="amina", password="a-good-password", role=StaffRole.ADMIN
+    )
+    repository.create_staff_user(
+        session, username="nadia", password="a-good-password", role=StaffRole.ADMIN
+    )
+    repository.create_staff_user(session, username="karim", password="a-good-password")
+
+
+def test_a_staff_user_can_be_deactivated_and_reactivated(session: Session) -> None:
+    _two_admins_and_a_staff_member(session)
+    assert repository.update_staff_user(session, "Karim", is_active=False).is_active is False
+    assert repository.update_staff_user(session, "karim", is_active=True).is_active is True
+
+
+def test_a_staff_user_can_be_promoted_and_demoted(session: Session) -> None:
+    _two_admins_and_a_staff_member(session)
+    promoted = repository.update_staff_user(session, "karim", role=StaffRole.ADMIN)
+    assert promoted.role is StaffRole.ADMIN
+    demoted = repository.update_staff_user(session, "nadia", role=StaffRole.STAFF)
+    assert demoted.role is StaffRole.STAFF
+
+
+def test_a_password_can_be_reset_and_the_old_one_stops_working(session: Session) -> None:
+    _two_admins_and_a_staff_member(session)
+    user = repository.update_staff_user(session, "karim", password="a-brand-new-password")
+    assert verify_password("a-brand-new-password", user.password_hash)
+    assert not verify_password("a-good-password", user.password_hash)
+    with pytest.raises(PasswordPolicyError):
+        repository.update_staff_user(session, "karim", password="short")
+
+
+def test_arguments_left_out_are_left_unchanged(session: Session) -> None:
+    _two_admins_and_a_staff_member(session)
+    before = repository.get_staff_user(session, "karim")
+    assert before is not None
+    old_hash = before.password_hash
+    after = repository.update_staff_user(session, "karim", is_active=False)
+    assert (after.role, after.password_hash) == (StaffRole.STAFF, old_hash)
+
+
+@pytest.mark.parametrize("change", [{"is_active": False}, {"role": StaffRole.STAFF}])
+def test_the_last_active_admin_cannot_be_deactivated_or_demoted(
+    session: Session, change: dict
+) -> None:
+    """With no active admin left, nobody could manage accounts through the product at all."""
+    _two_admins_and_a_staff_member(session)
+    repository.update_staff_user(session, "nadia", is_active=False)
+    with pytest.raises(LastAdminError, match="only active admin"):
+        repository.update_staff_user(session, "amina", **change)
+    # A second active admin makes the same change legitimate.
+    repository.update_staff_user(session, "nadia", is_active=True)
+    repository.update_staff_user(session, "amina", **change)
+
+
+def test_updating_an_unknown_staff_user_is_an_error(session: Session) -> None:
+    with pytest.raises(StaffNotFoundError, match="nobody"):
+        repository.update_staff_user(session, "nobody", is_active=False)
 
 
 def test_the_repr_of_a_staff_user_does_not_leak_the_hash(session: Session) -> None:

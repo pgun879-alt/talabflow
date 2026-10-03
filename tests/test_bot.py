@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from talabflow import repository
@@ -156,6 +157,68 @@ def test_one_failing_message_does_not_stop_the_batch(
     handled = runner.poll_once()
     assert calls["count"] == 3, "every message must be attempted"
     assert handled == 2, "the failed one is not counted, the others still are"
+
+
+def test_a_message_is_acknowledged_only_after_it_has_been_handled(
+    settings: Settings, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    """Regression guard: a crash between receiving a message and handling it lost the message.
+
+    The transport used to advance its position as soon as it handed a batch over, so if the
+    process died before the batch was handled, those customer messages were gone for good.
+    Now the position only moves once a message has been dealt with, so a restart receives it
+    again. ``KeyboardInterrupt`` stands in for the process being killed mid-batch.
+    """
+    runner = BotRunner(settings=settings, transport=transport, session_factory=session_factory)
+    transport.queue("/start")
+
+    original = runner.handle_message
+
+    def killed(message: InboundMessage) -> list[str]:
+        raise KeyboardInterrupt
+
+    runner.handle_message = killed  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        runner.poll_once()
+    assert transport.pending_count == 1, "an unhandled message must stay queued"
+    assert transport.sent == []
+
+    runner.handle_message = original  # type: ignore[method-assign]
+    assert runner.poll_once() == 1
+    assert transport.pending_count == 0
+    assert "Welcome" in transport.last_text()
+
+
+def test_a_message_that_fails_gets_an_apology_instead_of_silence(
+    settings: Settings,
+    transport: ScriptedTransport,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: one transient database error used to drop the message without a word.
+
+    The failing message is not retried for ever -- that would let one bad message block every
+    other customer -- but the customer is told to send it again rather than left waiting.
+    """
+    runner = BotRunner(settings=settings, transport=transport, session_factory=session_factory)
+    original = repository.get_or_create_customer
+    calls = {"count": 0}
+
+    def flaky(*args: object, **kwargs: object) -> object:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("database is locked")
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repository, "get_or_create_customer", flaky)
+    transport.queue("/new")
+    assert runner.poll_once() == 0
+    assert "send it again" in transport.last_text()
+    assert transport.pending_count == 0, "a failed message is acknowledged, not replayed for ever"
+
+    transport.queue("/new")
+    assert runner.poll_once() == 1
+    assert "1. Repair" in transport.last_text()
 
 
 def test_an_empty_poll_is_not_an_error(bot: BotRunner) -> None:

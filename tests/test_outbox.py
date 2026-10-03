@@ -5,13 +5,14 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from talabflow import repository
 from talabflow.db import session_scope
 from talabflow.models import OrderStatus, OutboxMessage, OutboxStatus, utcnow
 from talabflow.outbox import OutboxWorker, backoff_delay
+from talabflow.transports.base import OutboundMessage
 from talabflow.transports.scripted import ScriptedTransport
 
 
@@ -165,6 +166,36 @@ def test_repeated_failures_exhaust_the_attempt_budget_and_dead_letter(
     assert message.attempts == worker.settings.outbox_max_attempts
     # A dead message is not retried forever.
     assert worker.process_batch() == (0, 0)
+
+
+def test_an_unexpected_exception_still_counts_as_an_attempt(
+    settings, session_factory: sessionmaker[Session], queued_order: str
+) -> None:
+    """Regression guard: a message that made the transport *crash* was retried for ever.
+
+    The attempt counter was only saved for errors the transport contract names. Any other
+    exception rolled the increment back, so the row stayed at ``attempts = 0``, its lease expired,
+    it was claimed again, and it failed again -- with no limit and nothing dead-lettered.
+    """
+
+    class Buggy(ScriptedTransport):
+        def send(self, message: OutboundMessage) -> str:
+            raise KeyError("a bug in the transport, not a TransportError")
+
+    worker = OutboxWorker(settings=settings, transport=Buggy(), session_factory=session_factory)
+    for attempt in range(1, settings.outbox_max_attempts + 1):
+        assert worker.process_batch() == (0, 1)
+        (row,) = _messages(session_factory)
+        assert row.attempts == attempt
+        assert row.claimed_by is None, "the lease must be released, not left to expire"
+        with session_scope(session_factory) as session:
+            session.execute(update(OutboxMessage).values(next_attempt_at=utcnow()))
+
+    (row,) = _messages(session_factory)
+    assert row.status is OutboxStatus.DEAD
+    assert row.last_error is not None
+    assert "KeyError" in row.last_error
+    assert worker.process_batch() == (0, 0), "a dead message is never retried"
 
 
 def test_a_permanent_failure_skips_the_retry_budget_entirely(

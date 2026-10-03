@@ -50,6 +50,10 @@ def _say(engine: ConversationEngine, session: Session, customer: Customer, text:
         ("+213 (555) 123-456", "+213555123456"),
         ("0555-12-34-56", "0555123456"),
         ("  0555123456  ", "0555123456"),
+        # Arabic-Indic and Persian digits are stored as ASCII, so staff can search for them.
+        ("٠٥٥٥١٢٣٤٥٦", "0555123456"),
+        ("+٢١٣ ٥٥٥ ١٢٣ ٤٥٦", "+213555123456"),
+        ("۰۵۵۵۱۲۳۴۵۶", "0555123456"),
     ],
 )
 def test_normalise_phone_accepts_real_world_formatting(raw: str, expected: str) -> None:
@@ -223,6 +227,33 @@ def test_free_text_while_idle_is_redirected_to_help(
 
 
 # --------------------------------------------------------------------- validation
+
+
+@pytest.mark.parametrize("text", ["²", "①", "⁴²", pytest.param("9" * 5000, id="5000-digits")])
+def test_digit_like_input_that_is_not_a_number_re_prompts_instead_of_raising(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer, text: str
+) -> None:
+    """Regression guard: ``"²".isdigit()`` is true, but ``int("²")`` raises.
+
+    The exception escaped the handler, so the customer got no reply at all -- exactly what the
+    engine promises never to do for bad input. A very long run of digits fails the same way, on
+    Python's integer-conversion length limit.
+    """
+    long_engine = ConversationEngine(
+        services=conversation_engine.services, business_name="X", max_message_length=8000
+    )
+    _say(long_engine, session, customer, "/new")
+    replies = _say(long_engine, session, customer, text)
+    assert "1. Repair" in replies[0]
+    assert _state(session, customer).step == Step.AWAITING_SERVICE.value
+
+
+def test_the_service_menu_accepts_arabic_indic_digits(
+    conversation_engine: ConversationEngine, session: Session, customer: Customer
+) -> None:
+    _say(conversation_engine, session, customer, "/new")
+    _say(conversation_engine, session, customer, "٢")
+    assert _state(session, customer).draft_service_type == conversation_engine.services[1]
 
 
 def test_invalid_service_number_re_prompts_without_advancing(
