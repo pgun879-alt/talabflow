@@ -9,6 +9,7 @@ dead-lettering behaviour is tested without waiting on a real network.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 from collections import deque
 
@@ -68,10 +69,22 @@ class ScriptedTransport(MessageTransport):
     # -- transport interface -----------------------------------------------------
 
     def poll(self, *, timeout_seconds: float) -> list[InboundMessage]:
-        """Return every queued message at once. Never blocks -- this is an offline transport."""
+        """Return every queued message at once. Never blocks -- this is an offline transport.
+
+        In manual-acknowledgement mode the messages stay queued until :meth:`acknowledge` is
+        called, so an unhandled message is returned again by the next poll -- the same contract
+        the Telegram transport honours, which is what lets crash recovery be tested offline.
+        """
+        if self.manual_ack:
+            return list(self._inbound)
         drained = list(self._inbound)
         self._inbound.clear()
         return drained
+
+    def acknowledge(self, message: InboundMessage) -> None:
+        # Already acknowledged, or never queued here: nothing to do either way.
+        with contextlib.suppress(ValueError):
+            self._inbound.remove(message)
 
     def send(self, message: OutboundMessage) -> str:
         if self.permanent_failure:

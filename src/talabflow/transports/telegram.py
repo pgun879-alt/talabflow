@@ -16,6 +16,7 @@ bill is needed to run this.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -162,19 +163,48 @@ class TelegramTransport(MessageTransport):
         if not isinstance(result, list):
             raise TransportError("getUpdates returned an unexpected payload")
 
-        messages: list[InboundMessage] = []
+        parsed: list[tuple[int, InboundMessage]] = []
         highest = self._offset
         for update in result:
             if not isinstance(update, dict):
                 continue
             update_id = int(update.get("update_id", 0))
             highest = max(highest, update_id + 1)
-            parsed = _parse_message(update.get("message"))
-            if parsed is not None:
-                messages.append(parsed)
-        if highest != self._offset:
-            self._save_offset(highest)
+            message = _parse_message(update.get("message"))
+            if message is not None:
+                parsed.append((update_id, message))
+
+        if not self.manual_ack or not parsed:
+            # Nothing the caller will acknowledge, so the whole batch is acknowledged here.
+            if highest != self._offset:
+                self._save_offset(highest)
+            return [message for _, message in parsed]
+
+        # Manual acknowledgement. Telegram forgets an update as soon as a higher offset is
+        # requested, so the offset must not pass a message until the caller has handled it:
+        # otherwise a crash in between loses that customer's message for good.
+        #
+        # Each message carries the offset to resume from once it is done -- the next message's
+        # update id, or the end of the batch for the last one -- so unsupported updates that sit
+        # between or after the messages are skipped by the same acknowledgement. Unsupported
+        # updates *before* the first message have no one to acknowledge them and are skipped now.
+        first_update_id = parsed[0][0]
+        if first_update_id > self._offset:
+            self._save_offset(first_update_id)
+        messages: list[InboundMessage] = []
+        for index, (_, message) in enumerate(parsed):
+            resume_at = parsed[index + 1][0] if index + 1 < len(parsed) else highest
+            messages.append(replace(message, ack_token=str(resume_at)))
         return messages
+
+    def acknowledge(self, message: InboundMessage) -> None:
+        try:
+            resume_at = int(message.ack_token)
+        except ValueError:
+            return
+        # Never move backwards: a late or repeated acknowledgement must not replay updates.
+        if resume_at > self._offset:
+            self._save_offset(resume_at)
 
     def send(self, message: OutboundMessage) -> str:
         last_id = ""

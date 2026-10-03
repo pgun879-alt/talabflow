@@ -30,6 +30,9 @@ class InboundMessage:
     message_id: str = ""
     display_name: str | None = None
     received_at: datetime = field(default_factory=utcnow)
+    #: Opaque to the application. Set by a transport in manual-acknowledgement mode and handed
+    #: back through :meth:`MessageTransport.acknowledge`.
+    ack_token: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +60,12 @@ class MessageTransport(ABC):
 
     name: str = "base"
 
+    #: When false (the default), ``poll`` acknowledges what it returns: the messages are gone from
+    #: the provider the moment they are handed over. A consumer that wants to survive a crash sets
+    #: this to true and calls :meth:`acknowledge` once each message has actually been handled;
+    #: anything not acknowledged is delivered again.
+    manual_ack: bool = False
+
     @abstractmethod
     def poll(self, *, timeout_seconds: float) -> list[InboundMessage]:
         """Return any messages waiting, blocking up to ``timeout_seconds``.
@@ -75,6 +84,14 @@ class MessageTransport(ABC):
             PermanentTransportError: when delivery can never succeed.
             TransportError: on a transient failure worth retrying.
         """
+
+    def acknowledge(self, message: InboundMessage) -> None:
+        """Mark ``message`` as handled so it is never delivered again.
+
+        Only meaningful when :attr:`manual_ack` is true. Concrete no-op, so a transport with
+        nothing to acknowledge needs no override.
+        """
+        return None
 
     def close(self) -> None:
         """Release any held resources. Concrete no-op; transports with a client override it."""
