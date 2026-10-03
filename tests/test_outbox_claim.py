@@ -14,6 +14,7 @@ when two connections race.
 
 from __future__ import annotations
 
+import os
 import threading
 from datetime import timedelta
 
@@ -542,7 +543,15 @@ def test_order_and_event_rows_are_intact_after_a_duplicate_race(
 
 # ------------------------------------------------------------------ SQLite behaviour
 
+# These two read SQLite PRAGMAs, so they are skipped when the suite targets another database
+# through TALABFLOW_TEST_DATABASE_URL (see conftest.py).
+sqlite_only = pytest.mark.skipif(
+    bool(os.environ.get("TALABFLOW_TEST_DATABASE_URL")),
+    reason="SQLite-specific PRAGMA check",
+)
 
+
+@sqlite_only
 def test_sqlite_busy_timeout_is_set_so_concurrent_writers_wait(engine: Engine) -> None:
     """The claim relies on SQLite serialising writers rather than failing instantly."""
     with engine.connect() as connection:
@@ -558,9 +567,9 @@ def test_claim_is_a_single_statement(session_factory: sessionmaker[Session]) -> 
     """
     _queue_notifications(session_factory, 3)
     statements: list[str] = []
-    test_engine = create_engine(
-        str(session_factory.kw["bind"].url), future=True, connect_args={"check_same_thread": False}
-    )
+    url = session_factory.kw["bind"].url
+    connect_args = {"check_same_thread": False} if url.get_backend_name() == "sqlite" else {}
+    test_engine = create_engine(url, future=True, connect_args=connect_args)
 
     @event.listens_for(test_engine, "before_cursor_execute")
     def record(conn, cursor, statement, parameters, context, executemany):
@@ -578,6 +587,7 @@ def test_claim_is_a_single_statement(session_factory: sessionmaker[Session]) -> 
     test_engine.dispose()
 
 
+@sqlite_only
 def test_sqlite_schema_has_the_lease_columns(engine: Engine) -> None:
     create_all(engine)
     with engine.connect() as connection:
