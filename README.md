@@ -7,6 +7,7 @@ bot token and no network.**
 > Arabic *طَلَب* means "an order" or "a request". `talabflow` is the flow of a request from a
 > chat message to a closed record.
 
+[![CI](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml/badge.svg)](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-324%20passing-brightgreen)](#testing)
 [![Types](https://img.shields.io/badge/mypy-clean-brightgreen)](#testing)
@@ -411,7 +412,7 @@ Every row was verified by running the code.
 | Admin API: auth, RBAC, orders, status, stats, staff | ✅ 39 tests + live `curl` run |
 | XLSX / CSV export with formula-injection guard | ✅ 16 tests |
 | Alembic migrations | ✅ `upgrade`, `downgrade`, re-`upgrade` and `alembic check` all verified, and run in CI |
-| CI (format, lint, types, tests, migrations, hygiene) | ✅ Workflow committed and valid; **never executed on GitHub** — it has not been pushed |
+| CI (format, lint, types, tests, migrations, hygiene) | ✅ Workflow committed and valid. Its real status is the CI badge at the top of this file, which reports whatever GitHub last ran — including "no runs yet" |
 | Offline scripted transport | ✅ The default; the whole suite runs on it |
 | Telegram transport | ⚠️ Implemented and tested against a mock transport — request shape, offset persistence, parsing, error classification. **Not yet run against the real Bot API**, because that needs a bot token this project does not have. |
 | Docker image + compose | ✅ Image builds; `compose up` not exercised end-to-end |
@@ -463,6 +464,13 @@ tests/                 324 tests, fully offline
 
 The demo creates fictional customers and orders. The staff passwords printed by `scripts/demo.sh`
 are **demo values for a throwaway local database** and are not valid anywhere else.
+
+## Contributing and security
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — how to set the project up, the four gates every
+  change has to pass, and the parts of this code that need care.
+- **[SECURITY.md](SECURITY.md)** — the threat model, what counts as a vulnerability here, what
+  deliberately does not, and how to report one privately.
 
 ## License
 
