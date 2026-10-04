@@ -10,7 +10,12 @@ from talabflow.bot import BotRunner
 from talabflow.config import Settings
 from talabflow.db import session_scope
 from talabflow.models import OrderStatus
-from talabflow.transports.base import InboundMessage, TransportError
+from talabflow.transports.base import (
+    InboundMessage,
+    RateLimitedError,
+    TransportAuthError,
+    TransportError,
+)
 from talabflow.transports.scripted import ScriptedTransport
 
 from .conftest import HAPPY_PATH
@@ -78,8 +83,55 @@ def test_flood_control_refuses_a_customer_sending_too_fast(
     transport.queue_many(["/start"] * 6)
     runner.poll_once()
     texts = transport.sent_texts()
-    assert any("very quickly" in text for text in texts)
-    assert sum("very quickly" in text for text in texts) == 3
+    assert len(texts) == 4, "three answers, then one warning"
+    assert "very quickly" in texts[-1]
+
+
+def test_a_flooding_customer_is_warned_once_not_once_per_message(
+    settings: Settings, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    """Answering every excess message with a warning doubles the traffic of the very flood it
+    is meant to stop, and spends the bot's own send quota on someone who is not listening."""
+    tight = settings.model_copy(update={"user_messages_per_minute": 2})
+    runner = BotRunner(settings=tight, transport=transport, session_factory=session_factory)
+    transport.queue_many(["/start"] * 30)
+    runner.poll_once()
+    assert sum("very quickly" in text for text in transport.sent_texts()) == 1
+
+
+def test_the_flood_warning_is_given_again_in_a_later_burst(
+    settings: Settings, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    """Once the window has cleared the customer is served again, so a second burst later on is a
+    new event and earns a new warning."""
+    tight = settings.model_copy(update={"user_messages_per_minute": 1})
+    runner = BotRunner(settings=tight, transport=transport, session_factory=session_factory)
+    clock = [1000.0]
+    runner._clock = lambda: clock[0]
+
+    transport.queue_many(["/start"] * 3)
+    runner.poll_once()
+    assert sum("very quickly" in text for text in transport.sent_texts()) == 1
+
+    clock[0] += 61.0
+    transport.queue_many(["/start"] * 3)
+    runner.poll_once()
+    texts = transport.sent_texts()
+    assert sum("very quickly" in text for text in texts) == 2
+    assert sum("Welcome" in text for text in texts) == 2, "served again once the window cleared"
+
+
+def test_one_customers_flood_warning_does_not_use_up_anothers(
+    settings: Settings, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    tight = settings.model_copy(update={"user_messages_per_minute": 1})
+    runner = BotRunner(settings=tight, transport=transport, session_factory=session_factory)
+    transport.queue_many(["/start"] * 3, user_id="1001")
+    transport.queue_many(["/start"] * 3, user_id="2002")
+    runner.poll_once()
+    for chat in ("1001", "2002"):
+        warnings = [m for m in transport.sent if m.chat_id == chat and "very quickly" in m.text]
+        assert len(warnings) == 1, chat
 
 
 def test_flood_control_is_per_customer(
@@ -223,6 +275,118 @@ def test_a_message_that_fails_gets_an_apology_instead_of_silence(
 
 def test_an_empty_poll_is_not_an_error(bot: BotRunner) -> None:
     assert bot.poll_once() == 0
+
+
+# --------------------------------------------------------------------- provider limits
+
+
+class _FailingPoll(ScriptedTransport):
+    """A transport whose poll raises the given errors in turn, then behaves normally."""
+
+    def __init__(self, *errors: Exception) -> None:
+        super().__init__()
+        self.errors = list(errors)
+        self.polls = 0
+
+    def poll(self, *, timeout_seconds: float) -> list[InboundMessage]:
+        self.polls += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return super().poll(timeout_seconds=timeout_seconds)
+
+
+def _record_sleeps(runner: BotRunner) -> list[float]:
+    slept: list[float] = []
+    runner._sleep = slept.append
+    return slept
+
+
+def test_a_rate_limited_poll_waits_as_long_as_the_provider_asked(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Polling again after one second, when Telegram said "retry after 7", is refused again and
+    tends to lengthen the penalty."""
+    transport = _FailingPoll(RateLimitedError("slow down", retry_after=7))
+    runner = BotRunner(settings=settings, transport=transport, session_factory=session_factory)
+    slept = _record_sleeps(runner)
+    runner.run_forever(max_iterations=1, idle_sleep_seconds=1.0)
+    assert sum(slept) == pytest.approx(7.0)
+
+
+def test_repeated_poll_failures_back_off_instead_of_hammering(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    transport = _FailingPoll(*[TransportError("the network is down") for _ in range(4)])
+    runner = BotRunner(settings=settings, transport=transport, session_factory=session_factory)
+    slept = _record_sleeps(runner)
+    runner.run_forever(max_iterations=4, idle_sleep_seconds=1.0)
+    assert sum(slept) == pytest.approx(1 + 2 + 4 + 8)
+
+
+def test_the_poll_backoff_is_capped_and_resets_after_a_success(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    transport = _FailingPoll(*[TransportError("down") for _ in range(12)])
+    runner = BotRunner(settings=settings, transport=transport, session_factory=session_factory)
+    slept = _record_sleeps(runner)
+    runner.run_forever(max_iterations=12, idle_sleep_seconds=1.0)
+    assert sum(slept) == pytest.approx(1 + 2 + 4 + 8 + 16 + 32 + 60 * 6)
+
+    slept.clear()
+    runner.run_forever(max_iterations=1, idle_sleep_seconds=1.0)  # a clean, empty poll
+    assert sum(slept) == pytest.approx(1.0), "back to the ordinary idle pause"
+
+
+def test_a_rejected_token_stops_the_bot_instead_of_retrying_for_ever(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """An invalid token never becomes valid. Polling on, once a second, would look like a running
+    bot while serving nobody."""
+    transport = _FailingPoll(*[TransportAuthError("token rejected") for _ in range(50)])
+    runner = BotRunner(settings=settings, transport=transport, session_factory=session_factory)
+    _record_sleeps(runner)
+    with pytest.raises(TransportAuthError):
+        runner.run_forever(max_iterations=50, idle_sleep_seconds=0.01)
+    assert transport.polls == 1
+
+
+def test_a_briefly_rate_limited_reply_is_sent_after_the_requested_wait(
+    settings: Settings, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    runner = BotRunner(settings=settings, transport=transport, session_factory=session_factory)
+    slept = _record_sleeps(runner)
+    transport.rate_limit_next_sends = 1
+    transport.rate_limit_retry_after = 2.0
+    transport.queue("/start")
+    runner.poll_once()
+    assert "Welcome" in transport.last_text(), "the reply still reached the customer"
+    assert sum(slept) == pytest.approx(2.0)
+
+
+def test_a_long_rate_limit_on_a_reply_is_not_waited_out(
+    settings: Settings, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    """One customer's reply must not freeze the bot for every other customer for minutes."""
+    runner = BotRunner(settings=settings, transport=transport, session_factory=session_factory)
+    slept = _record_sleeps(runner)
+    transport.rate_limit_next_sends = 1
+    transport.rate_limit_retry_after = 120.0
+    transport.queue("/start")
+    assert runner.poll_once() == 1
+    assert transport.sent == []
+    assert slept == []
+
+
+def test_a_reply_that_is_rate_limited_twice_is_dropped_not_retried_for_ever(
+    settings: Settings, transport: ScriptedTransport, session_factory: sessionmaker[Session]
+) -> None:
+    runner = BotRunner(settings=settings, transport=transport, session_factory=session_factory)
+    _record_sleeps(runner)
+    transport.rate_limit_next_sends = 5
+    transport.rate_limit_retry_after = 1.0
+    transport.queue("/start")
+    assert runner.poll_once() == 1
+    assert transport.send_attempts == 2
 
 
 # --------------------------------------------------------------------- loop control

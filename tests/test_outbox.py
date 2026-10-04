@@ -12,7 +12,7 @@ from talabflow import repository
 from talabflow.db import session_scope
 from talabflow.models import OrderStatus, OutboxMessage, OutboxStatus, utcnow
 from talabflow.outbox import OutboxWorker, backoff_delay
-from talabflow.transports.base import OutboundMessage
+from talabflow.transports.base import OutboundMessage, TransportAuthError
 from talabflow.transports.scripted import ScriptedTransport
 
 
@@ -214,6 +214,177 @@ def test_a_permanent_failure_skips_the_retry_budget_entirely(
     assert message.status is OutboxStatus.DEAD
     assert message.attempts == 1, "one attempt, not the full budget"
     assert "permanent" in (message.last_error or "")
+
+
+# --------------------------------------------------------------------- provider limits
+
+
+def _queue_more(session_factory: sessionmaker[Session], count: int, *, channel: str = "scripted"):
+    """Queue ``count`` further notifications, each for its own order."""
+    with session_scope(session_factory) as session:
+        customer = repository.get_or_create_customer(
+            session, channel=channel, channel_user_id="1001", chat_id="1001", display_name="A"
+        )
+        for index in range(count):
+            order = repository.create_order(
+                session,
+                customer=customer,
+                service_type="Repair",
+                details=f"order number {index}",
+                contact_phone="+213555123456",
+                address="an address",
+            )
+            repository.change_order_status(
+                session, order=order, to_status=OrderStatus.CONFIRMED, actor="amina"
+            )
+
+
+def test_a_rate_limited_send_is_deferred_without_spending_an_attempt(
+    worker: OutboxWorker,
+    transport: ScriptedTransport,
+    queued_order: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Being throttled says nothing about the message. Counting it would let a busy hour
+    dead-letter notifications that were perfectly deliverable."""
+    transport.rate_limit_next_sends = 1
+    transport.rate_limit_retry_after = 40.0
+    before = utcnow()
+    assert worker.process_batch() == (0, 0)
+
+    (message,) = _messages(session_factory)
+    assert message.status is OutboxStatus.PENDING
+    assert message.attempts == 0
+    assert message.claimed_by is None, "the lease must be released, not left to expire"
+    assert message.next_attempt_at >= before + timedelta(seconds=40)
+    assert "rate" in (message.last_error or "").lower()
+
+
+def test_a_deferred_message_is_not_sent_before_the_provider_allows_it(
+    worker: OutboxWorker,
+    transport: ScriptedTransport,
+    queued_order: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    transport.rate_limit_next_sends = 1
+    transport.rate_limit_retry_after = 40.0
+    worker.process_batch()
+    assert worker.process_batch() == (0, 0)
+    assert transport.send_attempts == 1, "asked again before the delay had passed"
+
+    with session_scope(session_factory) as session:
+        session.execute(update(OutboxMessage).values(next_attempt_at=utcnow()))
+    assert worker.process_batch() == (1, 0)
+
+
+def test_a_rate_limit_stops_the_rest_of_the_batch(
+    worker: OutboxWorker,
+    transport: ScriptedTransport,
+    queued_order: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Every further send inside the penalty window is refused too. Trying them anyway only
+    extends the penalty."""
+    _queue_more(session_factory, 3)
+    transport.rate_limit_next_sends = 99
+    transport.rate_limit_retry_after = 25.0
+    before = utcnow()
+    assert worker.process_batch() == (0, 0)
+    assert transport.send_attempts == 1
+
+    messages = _messages(session_factory)
+    assert len(messages) == 4
+    for message in messages:
+        assert message.status is OutboxStatus.PENDING
+        assert message.attempts == 0
+        assert message.claimed_by is None
+        assert message.next_attempt_at >= before + timedelta(seconds=25)
+
+
+def test_a_retry_that_gets_rate_limited_keeps_its_attempt_count(
+    worker: OutboxWorker,
+    transport: ScriptedTransport,
+    queued_order: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    transport.fail_next_sends = 1
+    worker.process_batch()
+    with session_scope(session_factory) as session:
+        session.execute(update(OutboxMessage).values(next_attempt_at=utcnow()))
+
+    transport.rate_limit_next_sends = 1
+    assert worker.process_batch() == (0, 0)
+    (message,) = _messages(session_factory)
+    assert message.attempts == 1, "the earlier real failure still counts; the throttle does not"
+    assert message.status is OutboxStatus.FAILED
+
+
+def test_a_rejected_token_does_not_dead_letter_the_queue(
+    worker: OutboxWorker,
+    transport: ScriptedTransport,
+    queued_order: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """A mistyped token is a configuration fault. Treating it as "this customer can never be
+    reached" would throw away every queued notification, one by one."""
+    _queue_more(session_factory, 2)
+    transport.auth_failure = True
+    with pytest.raises(TransportAuthError):
+        worker.process_batch()
+    assert transport.send_attempts == 1
+
+    for message in _messages(session_factory):
+        assert message.status is OutboxStatus.PENDING
+        assert message.attempts == 0
+        assert message.claimed_by is None
+
+    transport.auth_failure = False  # the token is fixed and the worker restarted
+    assert worker.process_batch() == (3, 0)
+
+
+def test_a_rejected_token_stops_the_worker_loop(
+    worker: OutboxWorker, transport: ScriptedTransport, queued_order: str
+) -> None:
+    transport.auth_failure = True
+    with pytest.raises(TransportAuthError):
+        worker.run_forever(max_iterations=50)
+    assert transport.send_attempts == 1
+
+
+# --------------------------------------------------------------------- channels
+
+
+def test_a_worker_leaves_another_channels_messages_alone(
+    worker: OutboxWorker,
+    transport: ScriptedTransport,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """A chat id only means something on the channel it came from. Sending a WhatsApp customer's
+    notification through the Telegram transport reaches nobody -- or the wrong person."""
+    _queue_more(session_factory, 1, channel="whatsapp")
+    assert worker.process_batch() == (0, 0)
+    assert transport.send_attempts == 0
+    (message,) = _messages(session_factory)
+    assert message.status is OutboxStatus.PENDING, "left for the worker of its own channel"
+    assert message.attempts == 0
+
+
+def test_each_worker_delivers_its_own_channel(
+    settings, session_factory: sessionmaker[Session]
+) -> None:
+    _queue_more(session_factory, 2, channel="scripted")
+    _queue_more(session_factory, 1, channel="whatsapp")
+    whatsapp = ScriptedTransport(channel="whatsapp")
+    scripted = ScriptedTransport()
+
+    assert OutboxWorker(
+        settings=settings, transport=whatsapp, session_factory=session_factory
+    ).process_batch() == (1, 0)
+    assert OutboxWorker(
+        settings=settings, transport=scripted, session_factory=session_factory
+    ).process_batch() == (2, 0)
+    assert len(whatsapp.sent) == 1
+    assert len(scripted.sent) == 2
 
 
 # --------------------------------------------------------------------- batching

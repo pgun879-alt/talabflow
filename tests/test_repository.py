@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from talabflow import repository
@@ -127,6 +128,43 @@ def test_references_are_unique_across_many_orders(session: Session, customer: Cu
         for _ in range(40)
     }
     assert len(references) == 40
+
+
+def test_a_reference_collision_is_retried_with_a_new_reference(
+    session: Session, customer: Customer, order: Order, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    references = iter([order.reference, order.reference, "TF-20260101-ZZZZ"])
+    monkeypatch.setattr(repository, "generate_reference", lambda: next(references))
+    second = _order_with_phone(session, customer, "+213555123456")
+    assert second.reference == "TF-20260101-ZZZZ"
+    assert repository.list_orders(session).total == 2
+
+
+def test_a_database_error_that_is_not_a_collision_is_raised_not_retried(
+    session: Session, customer: Customer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing required value fails the same way on every attempt. Retrying it five times and
+    then reporting "could not allocate a unique reference" hides the real fault behind a wrong
+    one."""
+    generated: list[str] = []
+
+    def counting() -> str:
+        generated.append("TF-20260101-AAA" + "BCDEFGHJ"[len(generated)])
+        return generated[-1]
+
+    monkeypatch.setattr(repository, "generate_reference", counting)
+    with pytest.raises(IntegrityError):
+        repository.create_order(
+            session,
+            customer=customer,
+            service_type="Repair",
+            details=None,  # type: ignore[arg-type]
+            contact_phone="+213555123456",
+            address="an address",
+        )
+    assert len(generated) == 1
+    # The savepoint took the failure; the surrounding transaction is still usable.
+    assert _order_with_phone(session, customer, "+213555123456").id is not None
 
 
 def test_lookup_by_reference(session: Session, order: Order) -> None:

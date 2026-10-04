@@ -15,6 +15,8 @@ import pytest
 from talabflow.transports.base import (
     OutboundMessage,
     PermanentTransportError,
+    RateLimitedError,
+    TransportAuthError,
     TransportError,
 )
 from talabflow.transports.telegram import (
@@ -304,6 +306,67 @@ def test_rate_limiting_is_transient_and_reports_the_retry_delay() -> None:
     with pytest.raises(TransportError, match="retry after 12s") as info:
         transport.send(OutboundMessage(chat_id="42", text="hello"))
     assert not isinstance(info.value, PermanentTransportError)
+    transport.close()
+
+
+def test_a_rate_limit_carries_the_delay_the_caller_must_respect() -> None:
+    """The delay has to be a number a caller can act on, not only words in a message."""
+    transport = _transport(
+        httpx.MockTransport(
+            lambda r: _error(429, "Too Many Requests", parameters={"retry_after": 12})
+        )
+    )
+    with pytest.raises(RateLimitedError) as info:
+        transport.send(OutboundMessage(chat_id="42", text="hello"))
+    assert info.value.retry_after == 12
+    transport.close()
+
+
+@pytest.mark.parametrize(
+    "extra", [{}, {"parameters": None}, {"parameters": {}}, {"parameters": {"retry_after": "x"}}]
+)
+def test_a_rate_limit_without_a_usable_delay_is_still_a_rate_limit(extra: dict) -> None:
+    transport = _transport(httpx.MockTransport(lambda r: _error(429, "Too Many Requests", **extra)))
+    with pytest.raises(RateLimitedError) as info:
+        transport.poll(timeout_seconds=0)
+    assert info.value.retry_after == 0
+    transport.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "description"),
+    [
+        (401, "Unauthorized"),
+        (404, "Not Found"),  # what the Bot API answers for a token of the wrong shape
+    ],
+)
+def test_a_rejected_token_is_reported_as_a_credential_failure(
+    status: int, description: str
+) -> None:
+    """Told apart from "this customer blocked the bot": one is a broken deployment, the other a
+    single undeliverable message."""
+    transport = _transport(httpx.MockTransport(lambda r: _error(status, description)))
+    with pytest.raises(TransportAuthError):
+        transport.poll(timeout_seconds=0)
+    with pytest.raises(TransportAuthError):
+        transport.send(OutboundMessage(chat_id="42", text="hello"))
+    transport.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "description"),
+    [
+        (403, "Forbidden: bot was blocked by the user"),
+        (400, "Bad Request: chat not found"),
+    ],
+)
+def test_an_undeliverable_message_is_not_a_credential_failure(
+    status: int, description: str
+) -> None:
+    transport = _transport(httpx.MockTransport(lambda r: _error(status, description)))
+    with pytest.raises(PermanentTransportError) as info:
+        transport.send(OutboundMessage(chat_id="42", text="hello"))
+    assert not isinstance(info.value, TransportAuthError)
     transport.close()
 
 
