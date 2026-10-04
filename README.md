@@ -493,7 +493,7 @@ Every row was verified by running the code.
 |---|---|
 | Intake conversation state machine, persisted per customer | ✅ 66 tests |
 | Phone validation per country, E.164 storage, search by any spelling | ✅ 69 tests of the validator alone, plus conversation, search, export and API tests. Runs on libphonenumber's numbering data, offline |
-| *Share my phone number* button and the verified flag | ⚠️ Tested offline and against a mock Bot API (keyboard payload, own card vs somebody else's). Not yet exercised against real Telegram |
+| *Share my phone number* button and the verified flag | ✅ Tested offline and against a mock Bot API (keyboard payload, own card vs somebody else's), and exercised by hand on real Telegram (mobile app): tapping the button shared the account's own number and the order was stored as verified |
 | Order references (unambiguous alphabet, confusable correction) | ✅ 26 tests |
 | Status pipeline with guarded transitions | ✅ Tested, including every refusal |
 | Immutable audit trail per change | ✅ Verified in the demo output |
@@ -509,7 +509,7 @@ Every row was verified by running the code.
 | Alembic migrations | ✅ `upgrade`, `downgrade`, re-`upgrade` and `alembic check` all verified, and run in CI |
 | CI (format, lint, types, tests, migrations, hygiene) | ✅ Workflow committed and valid. Its real status is the CI badge at the top of this file, which reports whatever GitHub last ran — including "no runs yet" |
 | Offline scripted transport | ✅ The default; the whole suite runs on it |
-| Telegram transport | ⚠️ Implemented and tested against a mock transport — request shape, offset persistence, parsing, error classification. **Not yet run against the real Bot API**, because that needs a bot token this project does not have. |
+| Telegram transport | ⚠️ Tested against a mock transport — request shape, offset persistence, parsing, error classification — and run by hand against the real Bot API: long polling and the full intake conversation, ending in created orders. **Not yet exercised on real Telegram:** status notifications through the outbox worker, rate-limit and blocked-user errors, and a crash mid-batch. |
 | Docker image + compose | ✅ Image builds; `compose up` not exercised end-to-end |
 | WhatsApp | ❌ Not implemented (see Limitations) |
 | Web dashboard | ❌ Not implemented |
@@ -517,7 +517,8 @@ Every row was verified by running the code.
 
 The ⚠️ row is the honest boundary of what has been *executed*. The HTTP contract, offset
 handling and permanent-vs-transient error classification are all covered by tests against a mock
-transport, but no message has been sent through real Telegram from this code.
+transport. Real Telegram has only seen a manual run of the intake conversation — a handful of
+messages, not sustained traffic — and no status notification has been delivered through it yet.
 
 ## Roadmap
 
