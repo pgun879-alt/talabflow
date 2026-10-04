@@ -10,6 +10,8 @@ from .base import (
     MessageTransport,
     OutboundMessage,
     PermanentTransportError,
+    RateLimitedError,
+    TransportAuthError,
     TransportError,
 )
 from .scripted import ScriptedTransport
@@ -20,8 +22,10 @@ __all__ = [
     "MessageTransport",
     "OutboundMessage",
     "PermanentTransportError",
+    "RateLimitedError",
     "ScriptedTransport",
     "TelegramTransport",
+    "TransportAuthError",
     "TransportError",
     "build_transport",
 ]

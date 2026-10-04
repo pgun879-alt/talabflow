@@ -27,6 +27,8 @@ from .base import (
     MessageTransport,
     OutboundMessage,
     PermanentTransportError,
+    RateLimitedError,
+    TransportAuthError,
     TransportError,
 )
 
@@ -109,7 +111,9 @@ class TelegramTransport(MessageTransport):
         mean "no timeout at all".
 
         Raises:
+            TransportAuthError: when the bot token itself is rejected.
             PermanentTransportError: for errors that retrying cannot fix.
+            RateLimitedError: when Telegram asks for a pause, with the pause it asked for.
             TransportError: for transient failures.
         """
         try:
@@ -133,19 +137,29 @@ class TelegramTransport(MessageTransport):
             return body.get("result")
 
         description = str(body.get("description", "unknown error"))
-        if response.status_code == 401:
-            # An invalid token will never become valid by retrying.
-            raise PermanentTransportError("Telegram rejected the bot token (401)")
+        if response.status_code in (401, 404):
+            # 401 is a token Telegram does not know (mistyped, or revoked in @BotFather); 404 is
+            # what it answers when the token does not even have the right shape, because the
+            # token is part of the URL path. Neither becomes valid by retrying, and neither says
+            # anything about the message being sent. The token is never put in the error text.
+            raise TransportAuthError(f"Telegram rejected the bot token ({response.status_code})")
         if response.status_code == 403 or any(
             marker in description.lower() for marker in _PERMANENT_MARKERS
         ):
             raise PermanentTransportError(f"Telegram refused permanently: {description}")
         if response.status_code == 429:
-            retry_after = 0
+            retry_after = 0.0
             parameters = body.get("parameters")
             if isinstance(parameters, dict):
-                retry_after = int(parameters.get("retry_after", 0) or 0)
-            raise TransportError(f"Telegram rate-limited the request; retry after {retry_after}s")
+                try:
+                    retry_after = float(parameters.get("retry_after") or 0)
+                except (TypeError, ValueError):
+                    # A malformed hint must not turn a rate limit into a crash.
+                    retry_after = 0.0
+            raise RateLimitedError(
+                f"Telegram rate-limited the request; retry after {retry_after:g}s",
+                retry_after=retry_after,
+            )
         raise TransportError(f"Telegram error on {method}: {description}")
 
     # -- transport interface -----------------------------------------------------

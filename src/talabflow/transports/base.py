@@ -57,6 +57,21 @@ class TransportError(RuntimeError):
     """Delivery or polling failed. The message is safe to log."""
 
 
+class RateLimitedError(TransportError):
+    """The provider is throttling this deployment and said how long to stay quiet.
+
+    Kept apart from an ordinary transient failure because the right reaction is different. The
+    message is fine and so is the network: sending anything else before ``retry_after`` has passed
+    is refused as well, and usually lengthens the penalty. So callers wait as long as they were
+    told to, and do not count the refusal against the message.
+    """
+
+    def __init__(self, message: str, *, retry_after: float) -> None:
+        super().__init__(message)
+        #: Seconds the provider asked for. Zero when it did not say.
+        self.retry_after = max(float(retry_after), 0.0)
+
+
 class PermanentTransportError(TransportError):
     """The message can never be delivered -- the customer blocked the bot, or the chat is gone.
 
@@ -65,9 +80,21 @@ class PermanentTransportError(TransportError):
     """
 
 
+class TransportAuthError(PermanentTransportError):
+    """The provider rejected this deployment's credentials.
+
+    This is about the configuration, not about any one message: nothing can be received or sent
+    until it is fixed, and no amount of retrying fixes it. A process that hits it stops and says
+    so. It must never be handled like an undeliverable message -- that would dead-letter every
+    queued notification because of a typo in a token.
+    """
+
+
 class MessageTransport(ABC):
     """A two-way message channel."""
 
+    #: Also the *channel*: customers are recorded with the name of the transport they wrote in
+    #: through, and the outbox worker only delivers notifications for its own transport's name.
     name: str = "base"
 
     #: When false (the default), ``poll`` acknowledges what it returns: the messages are gone from

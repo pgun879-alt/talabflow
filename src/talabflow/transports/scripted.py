@@ -18,6 +18,8 @@ from .base import (
     MessageTransport,
     OutboundMessage,
     PermanentTransportError,
+    RateLimitedError,
+    TransportAuthError,
     TransportError,
 )
 
@@ -38,6 +40,14 @@ class ScriptedTransport(MessageTransport):
         self.fail_next_sends = 0
         #: When true, every send raises :class:`PermanentTransportError`.
         self.permanent_failure = False
+        #: Number of remaining sends that should be refused as rate-limited.
+        self.rate_limit_next_sends = 0
+        #: The delay a rate-limited send reports, in seconds.
+        self.rate_limit_retry_after = 30.0
+        #: When true, every send raises :class:`TransportAuthError`.
+        self.auth_failure = False
+        #: Every call to :meth:`send`, including the ones that raised.
+        self.send_attempts = 0
         self._ids = itertools.count(1)
 
     # -- script construction -----------------------------------------------------
@@ -95,6 +105,12 @@ class ScriptedTransport(MessageTransport):
             self._inbound.remove(message)
 
     def send(self, message: OutboundMessage) -> str:
+        self.send_attempts += 1
+        if self.auth_failure:
+            raise TransportAuthError("scripted credential failure")
+        if self.rate_limit_next_sends > 0:
+            self.rate_limit_next_sends -= 1
+            raise RateLimitedError("scripted rate limit", retry_after=self.rate_limit_retry_after)
         if self.permanent_failure:
             raise PermanentTransportError("scripted permanent failure")
         if self.fail_next_sends > 0:
