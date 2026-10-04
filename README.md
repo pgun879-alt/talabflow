@@ -11,7 +11,7 @@ bot token and no network.**
 
 [![CI](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml/badge.svg)](https://github.com/pgun879-alt/talabflow/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-489%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-518%20passing-brightgreen)](#testing)
 [![Types](https://img.shields.io/badge/mypy-clean-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -42,7 +42,7 @@ puts a real system behind it.
 
 | | Typical tutorial bot | `talabflow` |
 |---|---|---|
-| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 489 tests, zero network calls |
+| Testable without a bot token | No — you message it by hand | **Yes** — messaging is an interface with an offline transport; 518 tests, zero network calls |
 | Conversation state | A dict in memory, lost on restart | Persisted per customer; a half-finished order survives a restart |
 | Unscripted input | Breaks on anything unexpected | Explicit state machine; every invalid value re-prompts |
 | Phone numbers | Anything with enough digits | Checked against the numbering plan of the number's **own country**, stored in one canonical form, and marked *verified* when the customer shares their own contact — see [Phone numbers](#phone-numbers) |
@@ -256,7 +256,7 @@ make test
 Verified on Python 3.13.9, Linux, by running these commands after the most recent change:
 
 ```
-489 passed                                       # pytest
+518 passed                                       # pytest
 Success: no issues found in 19 source files      # mypy
 All checks passed!                               # ruff check
 41 files already formatted                       # ruff format --check
@@ -340,7 +340,7 @@ verified.
 | Group chats | Messages from groups, supergroups and channels are ignored. The intake conversation echoes a phone number and address back for confirmation, and status notifications go to the chat the customer last wrote from — in a group that would publish both. |
 | Spreadsheet formula injection | A customer can type `=HYPERLINK("http://evil","click")` into a chat field. Excel and LibreOffice evaluate that when staff open the export — free-text field to code execution on the buyer's machine. Leading formula triggers are prefixed with an apostrophe. Tested for both CSV and XLSX. The one exemption is a stored phone number — a plus sign followed only by digits, which cannot call a function or reference a cell. |
 | Markup injection | Telegram messages are sent with **no `parse_mode`**, because confirmations echo customer text back. |
-| Flood control | Per-customer sliding window on inbound messages; per-user on the API, returning 429 with `Retry-After`. |
+| Flood control | Per-customer sliding window on inbound messages. A customer over the limit is told so **once per window** and then ignored until it clears: answering every excess message would double the traffic of the flood and spend the bot's own send quota on it. Per-user on the API, returning 429 with `Retry-After`. |
 | Secrets | Never committed. `.env`, `data/`, `*.sqlite3` are git-ignored; `.env.example` holds placeholders. Secret fields use `repr=False`. The Alembic config reads the database URL from the environment so a connection string with a password is never in a committed file. |
 | Log hygiene | Structured JSON logs carry references, ids, counts and timings — **never** a phone number, an address, or a message body. `httpx` request lines are suppressed: it logs every URL at INFO, and the Telegram Bot API puts the bot token in the URL path. |
 | Shell execution | None. No customer or staff input ever reaches a shell. |
@@ -372,6 +372,18 @@ What the design does guarantee:
 - an attempt that ends in an **unexpected exception** — a bug in a transport, not a delivery
   error — is counted like any other failed attempt, so a message that reliably crashes the send
   is dead-lettered once its budget is spent instead of being retried for ever.
+
+**When the provider says no**, the reaction depends on which "no" it is:
+
+| Telegram answers | What happens |
+|---|---|
+| `429` with `retry_after` | Nothing is sent or polled again until that time has passed. In the worker the message **and the rest of the batch** go back to the queue untouched and **no attempt is counted** — being throttled says nothing about the message, and every further send inside the pause would be refused too. A conversational reply waits out a pause of up to 5 seconds and is retried once; a longer one is dropped rather than stalling every other customer. |
+| `401` / `404` on the token | The bot and the worker **stop**, exit non-zero and say which setting to check. Nothing is dead-lettered: the queue is exactly as deliverable as before, once the token is fixed. Polling on with a rejected token would look like a running bot while serving nobody. |
+| "bot was blocked", "chat not found" | That one message is dead-lettered at once. Permanent, and about that customer only. |
+| Anything else, or no answer | Transient. The worker retries with exponential backoff inside the attempt budget; the poll loop backs off from 1 second, doubling to a minute, and resets on the first success. |
+
+A worker only claims notifications for its own channel — a chat id means nothing on any other —
+so a second transport can be added later without one worker sending the other's messages.
 
 **Inbound messages** are acknowledged to Telegram only *after* they have been handled, so a
 crash partway through a batch does not lose the messages still waiting. That too is
@@ -475,6 +487,13 @@ sqlite3 data/talabflow.sqlite3 "SELECT id,status,attempts,last_error FROM outbox
 **An outbox message is `dead`** — either the retry budget was exhausted (`last_error` says why)
 or the customer blocked the bot, which is permanent and not retried.
 
+**`stopped: Telegram rejected the bot token`** — `run-bot` or `run-worker` exited on purpose.
+The token in `.env` is mistyped, incomplete, or was revoked in @BotFather. Fix
+`TALABFLOW_TELEGRAM_BOT_TOKEN` and start it again; no queued notification was lost.
+
+**`last_error` says `rate limited by the provider`** — Telegram asked for a pause. The message
+is still queued, no attempt was spent, and it goes out by itself once `next_attempt_at` arrives.
+
 **`409 Conflict` on a status change** — the transition is not allowed from the current status.
 The error message lists the permitted targets; `GET /v1/orders/{reference}` also returns
 `allowed_next_statuses`.
@@ -497,7 +516,7 @@ Every row was verified by running the code.
 | Order references (unambiguous alphabet, confusable correction) | ✅ 26 tests |
 | Status pipeline with guarded transitions | ✅ Tested, including every refusal |
 | Immutable audit trail per change | ✅ Verified in the demo output |
-| Transactional outbox + worker with retry/backoff/dead-letter | ✅ 18 tests |
+| Transactional outbox + worker with retry/backoff/dead-letter | ✅ 23 tests, including rate limits (deferred, not counted) and a rejected token (worker stops, nothing dead-lettered) |
 | Notification deduplication per event | ✅ Verified live and in tests |
 | Outbox claim + lease, so two workers never send the same message | ✅ 24 tests, including two real threads against one database and a worker losing its lease mid-batch. **Verified on SQLite and on PostgreSQL 16 in CI.** |
 | Crash recovery via lease expiry | ✅ Tested |
@@ -509,7 +528,7 @@ Every row was verified by running the code.
 | Alembic migrations | ✅ `upgrade`, `downgrade`, re-`upgrade` and `alembic check` all verified, and run in CI |
 | CI (format, lint, types, tests, migrations, hygiene) | ✅ Workflow committed and valid. Its real status is the CI badge at the top of this file, which reports whatever GitHub last ran — including "no runs yet" |
 | Offline scripted transport | ✅ The default; the whole suite runs on it |
-| Telegram transport | ⚠️ Tested against a mock transport — request shape, offset persistence, parsing, error classification — and run by hand against the real Bot API: long polling, the full intake conversation ending in created orders, and a status notification delivered through the outbox worker. **Not yet exercised on real Telegram:** rate-limit and blocked-user errors, and a crash mid-batch. |
+| Telegram transport | ⚠️ Tested against a mock transport — request shape, offset persistence, parsing, error classification — and run by hand against the real Bot API: long polling, the full intake conversation ending in created orders, and a status notification delivered through the outbox worker. **Not yet exercised on real Telegram:** rate-limit and blocked-user errors, and a crash mid-batch. Rate-limit and rejected-token handling were also run end to end through the real CLI against a local stand-in for the Bot API. |
 | Docker image + compose | ✅ Image builds; `compose up` not exercised end-to-end |
 | WhatsApp | ❌ Not implemented (see Limitations) |
 | Web dashboard | ❌ Not implemented |
@@ -554,7 +573,7 @@ src/talabflow/
 └── transports/        base (interface) · scripted (offline) · telegram (real)
 migrations/            Alembic; never imports application code
 scripts/               demo.sh, demo_conversation.py, demo_pipeline.py
-tests/                 489 tests, fully offline
+tests/                 518 tests, fully offline
 ```
 
 ## Sample data
