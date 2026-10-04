@@ -23,16 +23,27 @@ The window that remains, stated plainly: if a worker crashes **after** the provi
 message but **before** the ``sent`` commit, the lease eventually expires and the message is sent a
 second time. That is inherent to at-least-once over a provider without idempotency keys.
 
-Failures are separated by kind: a transient error backs off exponentially and retries; a permanent
-one (the customer blocked the bot) goes straight to ``dead`` rather than burning the attempt
-budget.
+Failures are separated by kind, because each one calls for something different:
+
+* a **transient** error backs off exponentially and retries, within an attempt budget;
+* a **permanent** one (the customer blocked the bot) goes straight to ``dead`` rather than burning
+  that budget;
+* a **rate limit** is not the message's fault at all. The message and the rest of the batch are
+  put back untouched, to be tried again once the pause the provider asked for has passed, and no
+  attempt is counted;
+* **rejected credentials** stop the worker. Nothing is dead-lettered: the queue is exactly as
+  deliverable as it was, once the configuration is fixed.
+
+A worker only claims messages for its own transport's channel.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from datetime import timedelta
+from collections.abc import Sequence
+from datetime import datetime, timedelta
+from typing import Final
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -43,10 +54,17 @@ from .transports.base import (
     MessageTransport,
     OutboundMessage,
     PermanentTransportError,
+    RateLimitedError,
+    TransportAuthError,
     TransportError,
 )
 
 logger = logging.getLogger(__name__)
+
+#: Bounds on the pause taken after a rate limit. At least a second, so a provider that names no
+#: delay is not asked again at once; at most an hour, so a nonsense value cannot park the queue.
+MIN_RATE_LIMIT_WAIT_SECONDS: Final = 1.0
+MAX_RATE_LIMIT_WAIT_SECONDS: Final = 3600.0
 
 
 def backoff_delay(attempts: int, *, base_seconds: int, cap_seconds: int = 3600) -> timedelta:
@@ -92,6 +110,11 @@ class OutboxWorker:
             provider_id = self.transport.send(
                 OutboundMessage(chat_id=message.chat_id, text=message.body)
             )
+        except (RateLimitedError, TransportAuthError):
+            # Neither is an outcome for *this message*; the batch loop deals with both. This
+            # clause must come first: rejected credentials are a kind of permanent error, and
+            # falling through would dead-letter the message for a fault in the configuration.
+            raise
         except PermanentTransportError as exc:
             # Retrying cannot help: the chat is gone or the bot is blocked.
             message.status = OutboxStatus.DEAD
@@ -179,6 +202,49 @@ class OutboxWorker:
                 extra={"outbox_id": message.id, "worker": self.worker_id},
             )
 
+    def _hand_back(
+        self,
+        session: Session,
+        messages: Sequence[OutboxMessage],
+        *,
+        until: datetime | None,
+        note: str | None,
+    ) -> None:
+        """Return claimed messages to the queue unsent, without counting an attempt.
+
+        Used when the reason for not sending has nothing to do with the messages themselves.
+        ``until`` postpones them; ``None`` leaves them due.
+
+        Each row is re-read first and only touched if this worker still holds it. If the write
+        fails, the leases are left to expire, which returns the messages to the queue anyway --
+        just later.
+        """
+        try:
+            for message in messages:
+                session.refresh(message)
+                if (
+                    message.status is not OutboxStatus.PROCESSING
+                    or message.claimed_by != self.worker_id
+                ):
+                    continue
+                # Back to the state it was claimed from: "failed" still means "has failed
+                # before and is waiting for a retry".
+                message.status = (
+                    OutboxStatus.FAILED if message.attempts > 0 else OutboxStatus.PENDING
+                )
+                if until is not None:
+                    message.next_attempt_at = until
+                if note is not None:
+                    message.last_error = note[:500]
+                repository.release_claim(message)
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception(
+                "could not hand messages back; their leases will expire instead",
+                extra={"worker": self.worker_id},
+            )
+
     # -- batches -----------------------------------------------------------------
 
     def process_batch(self) -> tuple[int, int]:
@@ -194,7 +260,12 @@ class OutboxWorker:
         them, and this worker would then send them a second time.
 
         Returns:
-            ``(sent, failed)`` counts for this batch.
+            ``(sent, failed)`` counts for this batch. Messages postponed by a rate limit are
+            neither.
+
+        Raises:
+            TransportAuthError: when the provider rejects the credentials. The claimed messages
+                are returned to the queue first.
         """
         sent = 0
         failed = 0
@@ -205,8 +276,9 @@ class OutboxWorker:
                 worker_id=self.worker_id,
                 limit=self.settings.outbox_batch_size,
                 lease_seconds=self.settings.outbox_lease_seconds,
+                channel=self.transport.name,
             )
-            for message in claimed:
+            for index, message in enumerate(claimed):
                 try:
                     if not repository.renew_claim(
                         session,
@@ -226,6 +298,37 @@ class OutboxWorker:
                     else:
                         failed += 1
                     session.commit()
+                except RateLimitedError as exc:
+                    # The rollback discards the attempt ``_deliver`` had counted. Everything not
+                    # yet sent goes back, this message included: any further send inside the
+                    # pause would be refused as well, and tends to lengthen it.
+                    session.rollback()
+                    wait = min(
+                        max(exc.retry_after, MIN_RATE_LIMIT_WAIT_SECONDS),
+                        MAX_RATE_LIMIT_WAIT_SECONDS,
+                    )
+                    unsent = claimed[index:]
+                    self._hand_back(
+                        session,
+                        unsent,
+                        until=utcnow() + timedelta(seconds=wait),
+                        note=f"rate limited by the provider; retry after {wait:g}s",
+                    )
+                    logger.warning(
+                        "rate limited; postponing the rest of the batch",
+                        extra={"worker": self.worker_id, "wait": wait, "postponed": len(unsent)},
+                    )
+                    break
+                except TransportAuthError:
+                    session.rollback()
+                    self._hand_back(session, claimed[index:], until=None, note=None)
+                    self._stopping = True
+                    logger.error(
+                        "the messaging provider rejected the credentials; stopping the worker. "
+                        "No notification was discarded",
+                        extra={"worker": self.worker_id},
+                    )
+                    raise
                 except Exception as exc:
                     session.rollback()
                     logger.exception(

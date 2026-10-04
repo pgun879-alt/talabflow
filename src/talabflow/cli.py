@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
@@ -24,7 +24,7 @@ from .repository import (
     StaffNotFoundError,
 )
 from .security import PasswordPolicyError
-from .transports import build_transport
+from .transports import TransportAuthError, build_transport
 
 app = typer.Typer(
     add_completion=False,
@@ -225,6 +225,16 @@ def set_status(
         )
 
 
+def _exit_on_rejected_credentials(error: TransportAuthError) -> NoReturn:
+    """Explain a rejected bot token and exit non-zero, instead of a traceback or a silent loop."""
+    console.print(f"[red]stopped:[/] {error}")
+    console.print(
+        "Check TALABFLOW_TELEGRAM_BOT_TOKEN in .env: it must be the token @BotFather gave you, "
+        "with nothing missing and no spaces. If you revoked it there, paste the new one."
+    )
+    raise typer.Exit(code=1) from error
+
+
 @app.command("run-bot")
 def run_bot(
     max_polls: Annotated[
@@ -239,6 +249,8 @@ def run_bot(
     console.print(f"[cyan]bot running[/] on transport={transport.name}  (Ctrl-C to stop)")
     try:
         handled = runner.run_forever(max_iterations=max_polls)
+    except TransportAuthError as exc:
+        _exit_on_rejected_credentials(exc)
     finally:
         transport.close()
     console.print(f"handled {handled} message(s)")
@@ -257,6 +269,8 @@ def run_worker(
     console.print(f"[cyan]outbox worker running[/] on transport={transport.name}")
     try:
         sent, failed = worker.run_forever(max_iterations=max_batches)
+    except TransportAuthError as exc:
+        _exit_on_rejected_credentials(exc)
     finally:
         transport.close()
     console.print(f"sent {sent}, failed {failed}")

@@ -8,6 +8,15 @@ Messages are acknowledged to the transport **after** they have been handled, not
 received. If the process dies partway through a batch, the unhandled messages are delivered again
 on restart instead of being lost. The cost is at-least-once handling: a crash in the narrow gap
 between committing a message's work and acknowledging it means that message is handled twice.
+
+How the loop treats the provider saying no
+------------------------------------------
+* **Rate limited** -- it waits as long as it was told to. Asking again sooner is refused again and
+  tends to lengthen the penalty.
+* **Any other poll failure** -- it backs off, doubling up to a minute, so an outage is not met
+  with a request every second. The first success resets it.
+* **Rejected credentials** -- it stops. A token that is wrong stays wrong, and a loop that keeps
+  polling with it looks like a running bot while serving nobody.
 """
 
 from __future__ import annotations
@@ -15,7 +24,9 @@ from __future__ import annotations
 import logging
 import signal
 import time
+from collections.abc import Callable
 from types import FrameType
+from typing import Final
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -25,9 +36,36 @@ from .conversation import ConversationEngine, Step
 from .db import session_scope
 from .messages import render
 from .security import SlidingWindowRateLimiter
-from .transports.base import InboundMessage, MessageTransport, OutboundMessage, TransportError
+from .transports.base import (
+    InboundMessage,
+    MessageTransport,
+    OutboundMessage,
+    RateLimitedError,
+    TransportAuthError,
+    TransportError,
+)
 
 logger = logging.getLogger(__name__)
+
+#: First pause after a failed poll; doubled on each consecutive failure up to the cap.
+POLL_BACKOFF_BASE_SECONDS: Final = 1.0
+MAX_POLL_BACKOFF_SECONDS: Final = 60.0
+
+#: Bounds on the pause taken when a poll is rate limited: at least a second, so a provider that
+#: names no delay is not asked again at once; at most an hour, so a nonsense value cannot stop
+#: the bot for a day.
+MIN_RATE_LIMIT_WAIT_SECONDS: Final = 1.0
+MAX_RATE_LIMIT_WAIT_SECONDS: Final = 3600.0
+
+#: The longest a single conversational reply waits out a rate limit before being dropped. Replies
+#: are sent from the poll loop, so waiting longer for one customer would stall all the others.
+MAX_REPLY_WAIT_SECONDS: Final = 5.0
+
+#: Sleeps are taken in slices no longer than this, so a stop request is noticed promptly.
+_SLEEP_SLICE_SECONDS: Final = 1.0
+
+#: How many flood-warning records are kept before the expired ones are swept out.
+_FLOOD_RECORDS_BEFORE_PRUNE: Final = 1024
 
 
 class BotRunner:
@@ -53,7 +91,15 @@ class BotRunner:
             phone_allowed_regions=settings.phone_allowed_regions,
         )
         self.flood_limiter = SlidingWindowRateLimiter(limit=settings.user_messages_per_minute)
+        #: identity -> the moment until which that customer has already been told to slow down.
+        self._flood_warned_until: dict[str, float] = {}
         self._stopping = False
+        self._poll_failures = 0
+        #: How long to wait before polling again after a failure; zero after a clean poll.
+        self._retry_delay = 0.0
+        # Seams for tests: time is read and spent only through these two.
+        self._clock: Callable[[], float] = time.monotonic
+        self._sleep: Callable[[float], None] = time.sleep
         # This runner acknowledges each message itself, once it has been handled.
         self.transport.manual_ack = True
 
@@ -78,8 +124,15 @@ class BotRunner:
     def handle_message(self, message: InboundMessage) -> list[str]:
         """Handle one message in its own transaction and return the replies that were sent."""
         identity = f"{message.channel}:{message.user_id}"
-        allowed, retry_after = self.flood_limiter.check(identity)
+        now = self._clock()
+        allowed, retry_after = self.flood_limiter.check(identity, now=now)
         if not allowed:
+            # One warning per window, then silence. Answering every excess message doubles the
+            # traffic of the very flood this is meant to stop, and spends the bot's own send
+            # quota -- the one its real customers depend on -- on someone who is not listening.
+            if self._flood_warned_until.get(identity, 0.0) > now:
+                return []
+            self._remember_flood_warning(identity, now)
             logger.warning(
                 "flood limit hit",
                 extra={"identity": identity, "retry_after": round(retry_after, 1)},
@@ -125,6 +178,22 @@ class BotRunner:
             logger.info("order created", extra={"reference": reference, "channel": message.channel})
         return texts
 
+    def _remember_flood_warning(self, identity: str, now: float) -> None:
+        """Record that ``identity`` was warned, for one full window from now."""
+        if len(self._flood_warned_until) >= _FLOOD_RECORDS_BEFORE_PRUNE:
+            self._flood_warned_until = {
+                key: until for key, until in self._flood_warned_until.items() if until > now
+            }
+        self._flood_warned_until[identity] = now + self.flood_limiter.window_seconds
+
+    def _pause(self, seconds: float) -> None:
+        """Sleep for ``seconds``, in short slices so a stop request cuts it short."""
+        remaining = seconds
+        while remaining > 0 and not self._stopping:
+            step = min(remaining, _SLEEP_SLICE_SECONDS)
+            self._sleep(step)
+            remaining -= step
+
     def _send(
         self,
         chat_id: str,
@@ -133,15 +202,23 @@ class BotRunner:
         contact_button: str | None = None,
         remove_keyboard: bool = False,
     ) -> None:
+        outbound = OutboundMessage(
+            chat_id=chat_id,
+            text=text,
+            contact_button=contact_button,
+            remove_keyboard=remove_keyboard,
+        )
         try:
-            self.transport.send(
-                OutboundMessage(
-                    chat_id=chat_id,
-                    text=text,
-                    contact_button=contact_button,
-                    remove_keyboard=remove_keyboard,
-                )
-            )
+            try:
+                self.transport.send(outbound)
+            except RateLimitedError as exc:
+                # A short pause is worth taking: the customer is waiting for this answer. A long
+                # one is not -- it would hold up every other customer -- and one retry is the
+                # limit, so a provider that keeps refusing cannot pin the loop here.
+                if exc.retry_after > MAX_REPLY_WAIT_SECONDS:
+                    raise
+                self._pause(max(exc.retry_after, MIN_RATE_LIMIT_WAIT_SECONDS))
+                self.transport.send(outbound)
         except TransportError as exc:
             # A failed conversational reply is not worth queueing: by the time it were retried
             # the customer's context would be gone. Status notifications, which *do* matter
@@ -151,14 +228,38 @@ class BotRunner:
     # -- loop --------------------------------------------------------------------
 
     def poll_once(self) -> int:
-        """Poll once and handle everything received. Returns the number of messages handled."""
+        """Poll once and handle everything received. Returns the number of messages handled.
+
+        Raises:
+            TransportAuthError: when the provider rejects the bot's credentials. The loop is
+                marked as stopping first; see the module docstring.
+        """
         try:
             messages = self.transport.poll(
                 timeout_seconds=self.settings.telegram_poll_timeout_seconds
             )
-        except TransportError as exc:
-            logger.warning("poll failed: %s", exc)
+        except TransportAuthError:
+            self._stopping = True
+            logger.error("the messaging provider rejected the bot's credentials; stopping")
+            raise
+        except RateLimitedError as exc:
+            self._poll_failures += 1
+            self._retry_delay = min(
+                max(exc.retry_after, MIN_RATE_LIMIT_WAIT_SECONDS), MAX_RATE_LIMIT_WAIT_SECONDS
+            )
+            logger.warning("poll rate limited; waiting %.0fs", self._retry_delay)
             return 0
+        except TransportError as exc:
+            self._poll_failures += 1
+            # The exponent is bounded so a week-long outage does not compute 2**600000.
+            doublings = min(self._poll_failures - 1, 16)
+            self._retry_delay = min(
+                POLL_BACKOFF_BASE_SECONDS * 2**doublings, MAX_POLL_BACKOFF_SECONDS
+            )
+            logger.warning("poll failed: %s (next try in %.0fs)", exc, self._retry_delay)
+            return 0
+        self._poll_failures = 0
+        self._retry_delay = 0.0
 
         handled = 0
         for message in messages:
@@ -203,6 +304,9 @@ class BotRunner:
 
         Returns:
             Total messages handled.
+
+        Raises:
+            TransportAuthError: when the provider rejects the bot's credentials.
         """
         total = 0
         iterations = 0
@@ -216,7 +320,9 @@ class BotRunner:
             iterations += 1
             handled = self.poll_once()
             total += handled
-            if handled == 0 and not self._stopping:
-                time.sleep(idle_sleep_seconds)
+            if self._retry_delay > 0:
+                self._pause(self._retry_delay)
+            elif handled == 0:
+                self._pause(idle_sleep_seconds)
         logger.info("bot stopped", extra={"handled": total})
         return total

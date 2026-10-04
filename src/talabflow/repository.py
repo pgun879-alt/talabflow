@@ -165,6 +165,13 @@ def create_order(
 
     The retry loop uses a SAVEPOINT so a collision does not poison the outer transaction --
     without it, the ``IntegrityError`` would abort everything the caller had done so far.
+
+    Only a collision is retried. Any other constraint failure -- a missing value, a customer that
+    does not exist -- fails identically on every attempt, so it is raised as it is.
+
+    Raises:
+        IntegrityError: for a constraint failure that is not a taken reference.
+        RuntimeError: if no free reference was found in the allowed number of attempts.
     """
     for attempt in range(_REFERENCE_ATTEMPTS):
         reference = generate_reference()
@@ -194,6 +201,12 @@ def create_order(
                 session.flush()
             return order
         except IntegrityError:
+            # The savepoint has been rolled back, so the session is usable again. Asking whether
+            # the reference is taken works on every database, unlike reading the driver's error
+            # text to find out which constraint failed.
+            taken = session.scalar(select(Order.id).where(Order.reference == reference))
+            if taken is None:
+                raise
             logger.warning(
                 "reference collision on %s (attempt %d); regenerating", reference, attempt + 1
             )
@@ -468,8 +481,13 @@ def claim_outbox_batch(
     limit: int,
     lease_seconds: int,
     now: datetime | None = None,
+    channel: str | None = None,
 ) -> list[OutboxMessage]:
     """Atomically lease up to ``limit`` due messages to ``worker_id``, and commit the lease.
+
+    ``channel`` restricts the claim to messages for customers of that channel. A worker passes
+    its transport's name: a chat id only means something on the channel it came from, so a
+    message for another channel is left for that channel's own worker. ``None`` claims any.
 
     Why a single guarded ``UPDATE``
     -------------------------------
@@ -509,16 +527,19 @@ def claim_outbox_batch(
         raise ValueError("lease_seconds must be positive")
 
     moment = now or utcnow()
+    claimable = _claimable(moment)
+    if channel is not None:
+        claimable = and_(claimable, OutboxMessage.channel == channel)
     candidate_ids = (
         select(OutboxMessage.id)
-        .where(_claimable(moment))
+        .where(claimable)
         .order_by(OutboxMessage.next_attempt_at, OutboxMessage.id)
         .limit(limit)
         .scalar_subquery()
     )
     session.execute(
         update(OutboxMessage)
-        .where(OutboxMessage.id.in_(candidate_ids), _claimable(moment))
+        .where(OutboxMessage.id.in_(candidate_ids), claimable)
         .values(
             status=OutboxStatus.PROCESSING,
             claimed_by=worker_id,
