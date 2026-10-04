@@ -509,7 +509,7 @@ Every row was verified by running the code.
 | Alembic migrations | ✅ `upgrade`, `downgrade`, re-`upgrade` and `alembic check` all verified, and run in CI |
 | CI (format, lint, types, tests, migrations, hygiene) | ✅ Workflow committed and valid. Its real status is the CI badge at the top of this file, which reports whatever GitHub last ran — including "no runs yet" |
 | Offline scripted transport | ✅ The default; the whole suite runs on it |
-| Telegram transport | ⚠️ Tested against a mock transport — request shape, offset persistence, parsing, error classification — and run by hand against the real Bot API: long polling and the full intake conversation, ending in created orders. **Not yet exercised on real Telegram:** status notifications through the outbox worker, rate-limit and blocked-user errors, and a crash mid-batch. |
+| Telegram transport | ⚠️ Tested against a mock transport — request shape, offset persistence, parsing, error classification — and run by hand against the real Bot API: long polling, the full intake conversation ending in created orders, and a status notification delivered through the outbox worker. **Not yet exercised on real Telegram:** rate-limit and blocked-user errors, and a crash mid-batch. |
 | Docker image + compose | ✅ Image builds; `compose up` not exercised end-to-end |
 | WhatsApp | ❌ Not implemented (see Limitations) |
 | Web dashboard | ❌ Not implemented |
@@ -517,8 +517,8 @@ Every row was verified by running the code.
 
 The ⚠️ row is the honest boundary of what has been *executed*. The HTTP contract, offset
 handling and permanent-vs-transient error classification are all covered by tests against a mock
-transport. Real Telegram has only seen a manual run of the intake conversation — a handful of
-messages, not sustained traffic — and no status notification has been delivered through it yet.
+transport. Real Telegram has only seen a manual run — the intake conversation and one status
+notification, a handful of messages, not sustained traffic or any of the error paths.
 
 ## Roadmap
 
